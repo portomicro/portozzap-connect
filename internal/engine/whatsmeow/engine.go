@@ -1,0 +1,316 @@
+// Package whatsmeow is the real WhatsApp side: one whatsmeow client per session,
+// translated into the canonical events the contract names.
+//
+// Nothing above this package imports whatsmeow, and nothing in it decides ownership.
+// A session runs here for as long as the layer above says this instance owns it, and
+// that layer closes it the moment the lease is gone.
+package whatsmeow
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/rs/zerolog"
+	"go.mau.fi/whatsmeow/proto/waCompanionReg"
+	waStore "go.mau.fi/whatsmeow/store"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/fazer-ai/whatsapp-connector/internal/engine"
+	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+	"github.com/fazer-ai/whatsapp-connector/internal/store"
+)
+
+// applyDeviceIdentity writes both halves of what the account's linked-devices list shows.
+//
+// The name alone is half an answer: whatsmeow leaves the platform UNKNOWN, and a
+// companion naming an OS no browser has, on a platform nothing sets, stands out in a
+// list whose every other row is a browser on somebody's machine. Written together so the
+// entry reads as the web session this behaves as.
+//
+// Takes the properties to write rather than reaching for the package-level ones, so the
+// claim can be tested without touching a value a pairing handshake elsewhere is reading.
+func applyDeviceIdentity(props *waCompanionReg.DeviceProps, name string) {
+	props.Os = proto.String(name)
+	props.PlatformType = waCompanionReg.DeviceProps_CHROME.Enum()
+}
+
+// deviceNameOnce guards the one write to whatsmeow's process-wide device properties.
+var deviceNameOnce sync.Once
+
+// Options is everything an engine needs beyond its device store.
+type Options struct {
+	// DeviceName is what the account's linked-devices list shows.
+	DeviceName string
+	// Media is where a session puts the file of an inbound message. The zero value is
+	// an instance with nowhere to write, which publishes media messages with no file to
+	// fetch.
+	Media MediaOptions
+	// Queueing is told what an emission had to wait for. Nil means nobody is watching,
+	// which is what a test that does not care about it passes.
+	Queueing Queueing
+}
+
+// Queueing is how the engine reports its own back pressure to whoever is measuring.
+//
+// An interface here and not a metric, because this package has no business knowing what
+// Prometheus is: the one implementation lives in `internal/app`, next to the registry.
+// It is also why the engine can report this at all -- there was no route from here to
+// the metric set, which is exactly why the stall in #221 went unmeasured.
+type Queueing interface {
+	// Emitted is called once per emission that reaches the pump: `waited` is how long
+	// it sat because the inbox was full, and `depth` is how many were already queued
+	// when it arrived. A waited of zero is the ordinary case and the common one.
+	Emitted(waited time.Duration, depth int)
+	// Dropped is one emission the inbox had no room for and that its caller chose not
+	// to wait for. Presence does that by design, and an inbound delivery does it once
+	// its bound runs out; either way the client is never told, so this counter is the
+	// only place the loss is visible at all.
+	Dropped(eventType protocol.EventType)
+}
+
+// Engine hands out one session per account, backed by a shared device store.
+type Engine struct {
+	store    *store.Container
+	media    MediaOptions
+	queueing Queueing
+	log      zerolog.Logger
+
+	mu       sync.Mutex
+	sessions map[string]*Session
+	closed   bool
+}
+
+// New returns an engine over an open store.
+//
+// The device name is set once, process-wide, because that is the only place whatsmeow
+// keeps it: `store.DeviceProps` is a package-level value read during the pairing
+// handshake, so a per-session name would mean mutating a global in the middle of every
+// pairing and racing every other session doing the same. `session.connect` carries a
+// `device_name` the contract promises, and this is why it cannot be honoured per
+// session; the deployment's own name is what the account's linked-devices list shows.
+//
+// An engine that was given a blob store and no address to advertise it under is
+// refused rather than run: the reference it would publish is a path with no host, and a
+// client reading one has no way to tell it apart from a URL it simply cannot reach.
+//
+//nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
+func New(container *store.Container, opts Options, log zerolog.Logger) (*Engine, error) {
+	if opts.Media.Blobs != nil {
+		if err := reachableAt(opts.Media.BaseURL); err != nil {
+			return nil, err
+		}
+		if ttl := opts.Media.Blobs.TTL(); ttl <= deliverTimeout {
+			// The clock starts when the file is stored and the reference is published
+			// afterwards, with a message allowed to spend deliverTimeout waiting for the
+			// publisher. A cache that keeps a blob for less than that hands out
+			// references the sweeper has already collected, which the client reads as
+			// media that is gone.
+			return nil, fmt.Errorf(
+				"whatsmeow: blobs are kept for %s and a message may spend %s waiting to be published, "+
+					"so a reference could name a blob that was swept before the client was told about it",
+				ttl, deliverTimeout)
+		}
+	}
+	if deviceName := opts.DeviceName; deviceName != "" {
+		// A package-level value in whatsmeow, read by its pairing handshake while
+		// marshalling the registration payload. Written exactly once so a second engine
+		// cannot assign it, and the first name wins, which is the deployment's own since
+		// a process runs one engine.
+		//
+		// What keeps the write off the racing side is not the Once, which orders it
+		// against another write and not against that read: it is that this runs while
+		// the engine is being built, before it has a session, let alone a client with a
+		// socket. A process that built a second engine while the first was pairing would
+		// have the Once find nothing to do, so there is still only ever the one write --
+		// and it is already long done.
+		deviceNameOnce.Do(func() { applyDeviceIdentity(waStore.DeviceProps, deviceName) })
+	}
+	return &Engine{
+		store:    container,
+		media:    opts.Media,
+		queueing: opts.Queueing,
+		log:      log,
+		sessions: make(map[string]*Session),
+	}, nil
+}
+
+// reachableAt reports whether blobs published under this address could be fetched.
+//
+// It is checked once, at startup, rather than found out per message: a reference is
+// published after the message it belongs to has been acknowledged, so an address a
+// client cannot fetch from costs the file rather than an error somebody sees. An
+// operator who left the scheme off, which is the ordinary way to get this wrong, is told
+// so by a container that will not start.
+func reachableAt(base string) error {
+	if base == "" {
+		return errors.New("whatsmeow: a blob store needs the address this instance is reached at")
+	}
+	address, err := url.Parse(base)
+	if err != nil {
+		return fmt.Errorf("whatsmeow: %q is not an address blobs can be published under: %w", base, err)
+	}
+	if address.Scheme != "http" && address.Scheme != "https" {
+		// Covers the bare `host:port`, which url.Parse reads as the scheme `host` with
+		// an opaque body rather than refusing.
+		return fmt.Errorf(
+			"whatsmeow: blobs are published under %q, and a client fetches them over http or https", base)
+	}
+	host := address.Hostname()
+	if host == "" {
+		// Hostname rather than Host: `http://:8080` parses with an authority of
+		// ":8080", which is a port and nobody to ask for it.
+		return fmt.Errorf("whatsmeow: blobs are published under %q, which names no host", base)
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
+		// `0.0.0.0` and `::` say "every interface" to a listener and mean "this machine"
+		// to whoever dials them, so a client elsewhere connects to itself. Loopback is
+		// not refused with them: an instance sharing a network namespace with its client
+		// is a deployment somebody really runs.
+		return fmt.Errorf(
+			"whatsmeow: blobs are published under %q, which is an address to listen on rather than one to reach",
+			base)
+	}
+	if strings.HasSuffix(address.Host, ":") {
+		// Port() cannot tell this apart: it answers "" both for an address that names no
+		// port, which is a fine thing to publish under, and for one whose port is a
+		// colon with nothing after it, which a client reads as 80 and dials a listener
+		// that is somebody else.
+		return fmt.Errorf(
+			"whatsmeow: blobs are published under %q, whose colon is followed by no port", base)
+	}
+	if port := address.Port(); port != "" {
+		// url.Parse only checks that a port is digits, so 99999 and 00 both come through
+		// it. Range-checked rather than compared against "0": zero is what a listener
+		// reads as "any free port", which is not a port anybody can be told to come back
+		// to, and it is spelled more than one way.
+		number, err := strconv.Atoi(port)
+		if err != nil || number < 1 || number > 65535 {
+			return fmt.Errorf("whatsmeow: blobs are published under %q, and %q is not a port to dial", base, port)
+		}
+	}
+	if strings.ContainsAny(base, "?#") {
+		// Read off the raw address rather than off the parsed fields, because the parse
+		// hides the two shapes that matter: a bare `?` leaves RawQuery empty and is
+		// recorded only in ForceQuery, and a bare `#` is recorded nowhere at all. Both
+		// still take the id with them — the blob's id is appended as a path segment, so
+		// `http://host/?` publishes a query of `/media/<id>` and reaches nothing.
+		return fmt.Errorf(
+			"whatsmeow: blobs are published under %q, and a blob's id is appended to it as a path", base)
+	}
+	return nil
+}
+
+// Open prepares a session with the device it paired, or a fresh one when it has not
+// paired yet. It does not touch the network.
+func (e *Engine) Open(ctx context.Context, sid string) (engine.Session, error) {
+	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		return nil, errors.New("whatsmeow: the engine is closed")
+	}
+	if existing, ok := e.sessions[sid]; ok {
+		if !existing.Closed() {
+			e.mu.Unlock()
+			return existing, nil
+		}
+		// A closed session holds a socket that cannot be reopened, so the next Open
+		// builds a new client rather than handing back one that will never connect.
+		delete(e.sessions, sid)
+	}
+	e.mu.Unlock()
+
+	// The store as this session sees it, with a fence of its own. Every session-scoped
+	// write goes through it, so a device this session builds later -- after a logout, or a
+	// mapping that went stale -- stands behind the same fence as the first one.
+	scoped := e.store.For(sid)
+	device, err := scoped.Device(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("whatsmeow: open %s: %w", sid, err)
+	}
+
+	wa := newLibraryLogger(e.log, sid)
+	session := newSession(ctx, sid, newClient(device, wa), scoped, e.media, e.queueing, e.log, wa)
+	if err := session.standOnWhatWasAsked(ctx); err != nil {
+		_ = session.Close()
+		return nil, fmt.Errorf("whatsmeow: open %s: %w", sid, err)
+	}
+	// Registered before the session can be handed out, so a close that happens while
+	// this function is still running is not one nobody hears about.
+	session.onClose(func() { e.forget(sid, session) })
+
+	e.mu.Lock()
+	// Unlocked before any Close below. A closing session calls back into forget, which
+	// takes this lock, and holding it across the call would have the two wait on each
+	// other.
+	if e.closed {
+		e.mu.Unlock()
+		_ = session.Close()
+		return nil, errors.New("whatsmeow: the engine is closed")
+	}
+	// Open can be reached twice for one session. The second caller must get the first
+	// session rather than a second client on the same credentials.
+	if winner, ok := e.sessions[sid]; ok && !winner.Closed() {
+		e.mu.Unlock()
+		_ = session.Close()
+		return winner, nil
+	}
+	e.sessions[sid] = session
+	e.mu.Unlock()
+
+	// A close that landed before the entry existed found nothing to remove, so the
+	// entry it should have taken is this one.
+	if session.Closed() {
+		e.forget(sid, session)
+		return session, nil
+	}
+	// Only the session that won the entry, and only once it has. A session built and
+	// then discarded above would otherwise arm a second set of timers for bubbles the
+	// winner is already holding, and both would publish.
+	session.rearm(ctx)
+	return session, nil
+}
+
+// forget drops a session from the cache once it is closed.
+//
+// Without it an entry lives until the same account is opened here again, which for a
+// fleet member that has handed its sessions on is never: it would go on holding every
+// whatsmeow client it ever ran, each with the device credentials and channels behind it.
+//
+// The session is compared and not just the id, because a closed session and the one
+// that replaced it share an id, and the replacement is the one still running.
+func (e *Engine) forget(sid string, session *Session) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.sessions[sid] == session {
+		delete(e.sessions, sid)
+	}
+}
+
+// Close shuts every session down.
+func (e *Engine) Close() error {
+	e.mu.Lock()
+	sessions := make([]*Session, 0, len(e.sessions))
+	for _, session := range e.sessions {
+		sessions = append(sessions, session)
+	}
+	e.sessions = make(map[string]*Session)
+	e.closed = true
+	e.mu.Unlock()
+
+	var errs []error
+	for _, session := range sessions {
+		errs = append(errs, session.Close())
+	}
+	// After the sessions, which hang up their calls over it.
+	if e.media.Calls != nil {
+		errs = append(errs, e.media.Calls.Close())
+	}
+	return errors.Join(errs...)
+}

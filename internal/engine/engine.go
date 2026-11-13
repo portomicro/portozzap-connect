@@ -1,0 +1,373 @@
+// Package engine is the WhatsApp side, behind an interface.
+//
+// Everything above it is written against these two types and never against
+// whatsmeow, which is what lets the whole connector be tested without a socket and
+// what makes replacing the engine a change in one package.
+package engine
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+)
+
+// ErrNotSupported is returned by an engine that does not implement a command. It is
+// reported to the client as protocol.ErrorUnsupported.
+var ErrNotSupported = errors.New("engine: command not supported")
+
+// ErrMayHaveLanded marks a failure that happened with a write already on its way to
+// WhatsApp, so what the command was about may have happened and nothing here will ever say
+// whether it did.
+//
+// The mark goes on the failure and not on its absence, and that asymmetry is the whole
+// design. The layer above keeps a command's idempotency record standing only for a failure
+// carrying this, and releases every other one. A mark forgotten therefore costs a
+// redelivery that carries the work out again, which is what this connector did before #282
+// and what the receiving side has always had to tolerate; a mark put where it does not
+// belong costs a command that can never run again under its key -- a device left linked, a
+// message that never goes out -- with nothing to say why. Four review rounds of #282 found
+// five of that second kind under the opposite default, each in a different family, which is
+// what a design that has to be complete before it is safe looks like from the inside.
+//
+// So it belongs at the call that writes, and nowhere earlier. A lookup before the write, a
+// privacy setting that could not be read, a lock that timed out: none of those reached
+// WhatsApp, and none of them carries this.
+var ErrMayHaveLanded = errors.New("engine: the write may already have reached WhatsApp")
+
+// MayHaveLanded marks an error as one of those without changing a character of what it
+// says. The message belongs to the client and the mark belongs to the ledger, and joining
+// them with %w would put "may already have reached WhatsApp" into the text of a failure
+// that is about a disk this instance could not write.
+func MayHaveLanded(err error) error {
+	if err == nil {
+		return nil
+	}
+	return mayHaveLanded{err}
+}
+
+type mayHaveLanded struct{ error }
+
+func (m mayHaveLanded) Is(target error) bool { return target == ErrMayHaveLanded }
+
+func (m mayHaveLanded) Unwrap() error { return m.error }
+
+// Emission is one thing the engine has to tell the client about. The engine names the
+// type and renders the payload; stamping it (id, epoch, seq, instance) belongs to the
+// session, which is the only thing that knows the ownership it is publishing under.
+type Emission struct {
+	Type    protocol.EventType
+	Payload json.RawMessage
+
+	// At is when the engine learned the thing this reports, in epoch milliseconds like
+	// every timestamp that crosses the wire, and it is what the frame's `ts` carries.
+	// Zero is the engine not saying, and the session stamps the moment it publishes
+	// instead -- no real reading is zero, and 1970 is not a moment WhatsApp reports.
+	//
+	// The distinction is the whole of what a reader can do about a late event. Stamped at
+	// publication, a typing indicator that spent nine of its ten seconds in a queue goes
+	// out looking new, and the freshness rule the contract asks a reader to apply has
+	// nothing to apply it to. The engine is the only layer that knows when the fact
+	// happened, so it is the one that says.
+	At int64
+	// Decided is when this session judged the thing it is about to report, read before
+	// anything that can wait. Zero is an emission nobody is timing, which is all of them
+	// but the one below.
+	//
+	// It is not `At` and cannot be, although both are moments. `At` is when the fact
+	// happened, in WhatsApp's clock where WhatsApp gives one, and it crosses the wire as
+	// the frame's `ts`; this is when *this process* decided, and it never leaves the
+	// process. Measured: `At` is read inside `emitting`, which runs after the transition
+	// lock has been acquired, so a distance computed from it starts after the wait that
+	// #182 is about -- "every arm waiting on that lock waits behind it, including the one
+	// that decides a socket is gone". Reusing `At` would report the cost of the publish
+	// while omitting the cost of getting to it.
+	//
+	// It travels on the emission rather than in a map of decisions in flight because
+	// `publish` has four ways to return without landing, and a map cleaned only on the
+	// happy path grows without bound in exactly the session whose publisher is down --
+	// the condition this measurement exists to observe.
+	Decided time.Time
+	// Retires says this session has nothing left to do on its own once this emission is
+	// out: the engine is reporting a state it will not come back from without being told
+	// to try again. A temporary ban, a client WhatsApp will not talk to and a connect it
+	// refused are the three -- whatsmeow publishes each of them from the branch that told
+	// the socket to stay down, so no reconnection is coming.
+	//
+	// It travels on the emission rather than beside it because the order is the point.
+	// The event says what happened and this says the session is finished; a client that
+	// got the second first would see the account handed over with nothing saying why.
+	//
+	// What the connector does with it is hand the lease back. The account then belongs to
+	// nobody until a command adopts it again, which is what lets another instance be the
+	// one that tries -- and on an outdated client, one running a newer build.
+	Retires bool
+	// Attempt names the giving-up this emission belongs to, as `Finished` reported it
+	// when the emission was made, and zero on everything that does not retire. The reader
+	// compares the two: an emission about a giving-up the session has moved on from is
+	// one a retry has already answered.
+	Attempt uint64
+
+	// Settle, when it is set, is called exactly once with the outcome of publishing
+	// this emission: nil once the client can be assumed to have it, an error when it
+	// never reached the stream. It is what lets an engine hold WhatsApp's own
+	// acknowledgement back until the event is durable, which is the whole difference
+	// between losing Redis costing a redelivery and losing Redis costing a message.
+	// An emission that leaves it nil is published like any other and nobody waits.
+	//
+	// The publisher owes the callback for every emission it takes, including the ones
+	// it drops. What it cannot answer for is an emission the engine hands over after
+	// nobody is reading any more, so an engine that waits on this must have a way out
+	// of its own when its session ends.
+	Settle func(error)
+
+	// Expires, when it is set, reports how much longer this emission is worth publishing
+	// for; zero or less is not any more. Nil is forever, which is every event that states
+	// a fact: a message, a receipt, a session's state.
+	//
+	// It exists for the few that state a moment instead. A typing indicator that waited
+	// out a backlog is published as a claim about now, and now has moved; the state that
+	// would have corrected it was already dropped for the same backlog. An engine that
+	// sets this is saying the event is worth nothing late.
+	//
+	// A remaining time rather than a yes or no, because the publisher has to bound the
+	// write and not merely decide before it: a stream that is retrying through an outage
+	// can take longer than the whole life of the event, and a check that ran before it
+	// started has already been answered by the time it lands. The publisher owes the
+	// Settle callback either way, and an emission dropped for age settles as a success:
+	// nothing failed, it stopped being worth writing.
+	Expires func() time.Duration
+	// Claim, when it is set, is asked at the last moment before the write whether this
+	// emission is still the one to make, and a false drops it as a success rather than a
+	// failure: nothing went wrong, something else answered the question first.
+	//
+	// It exists for an emission that stands in for another one that may yet turn up. The
+	// engine cannot decide that where it queues, because the thing it is watching for can
+	// land while the emission waits its turn, and a stand-in published ahead of the real
+	// event is kept over it by a client that deduplicates on the id. Asked here, the
+	// choice is made where it stops being reversible.
+	Claim func() bool
+}
+
+// Engine opens sessions. One process has one engine; a session is one WhatsApp
+// account.
+type Engine interface {
+	// Open prepares the session for a device, resuming a stored one when there is
+	// one. It does not connect: Session.Connect does, so that a session can be opened
+	// and inspected without touching the network.
+	Open(ctx context.Context, sid string) (Session, error)
+	// Close releases whatever the engine holds process-wide.
+	Close() error
+}
+
+// Session is one WhatsApp account as this connector holds it.
+//
+// Everything blocking takes a context. An engine may recover its own socket, and the
+// whatsmeow one has to: WhatsApp closes the stream in the middle of pairing and
+// expects the client back, so a client that never reconnects never finishes pairing.
+// What an engine must not do is decide whether this instance still owns the account.
+// That is the layer above, which holds the lease and closes the session the moment it
+// is gone.
+type Session interface {
+	// Connect starts pairing or resumes a stored session. Progress arrives on Events,
+	// not as a return value: pairing is a conversation, not a call.
+	Connect(ctx context.Context, req ConnectRequest) error
+	// Disconnect drops the socket and keeps the stored credentials.
+	Disconnect(ctx context.Context) error
+	// Logout ends the session on WhatsApp's side too, so resuming is impossible and
+	// the next connect has to pair again.
+	Logout(ctx context.Context) error
+	// Delete is Logout for an account nobody is coming back to, and the difference is
+	// what it does when WhatsApp will not answer.
+	//
+	// Logout keeps credentials that still resume when the request never left, because
+	// the operator asked to unlink a device and is still running the account: throwing
+	// the credentials away would cost them a fresh pairing for a logout that visibly
+	// failed. Delete is asked by a client that has already destroyed the inbox on its
+	// side, so there is nobody left to pair again and the account this connector holds
+	// is one nothing addresses. Credentials kept there are a device linked on somebody's
+	// phone with nothing on this side that corresponds to it.
+	//
+	// So the unlink is attempted and its refusal is reported without stopping the rest:
+	// what WhatsApp was told is best effort, what this connector holds is not. What is
+	// left when it ends is a session with nothing to try, which it says the way every
+	// other giving-up says it -- the emission that reports the teardown is marked, so the
+	// lease goes back rather than being held for an account that no longer exists.
+	Delete(ctx context.Context) error
+	// Execute carries out one command and returns the `result` half of the reply.
+	// A nil result with a nil error is a command whose reply carries no data.
+	Execute(ctx context.Context, command *protocol.Command) (json.RawMessage, error)
+	// Events is closed when the session is done. Reading it is the only way to learn
+	// what the engine has to say.
+	Events() <-chan Emission
+	// Finished names the giving-up this session is on, or zero while there is still
+	// something to try: WhatsApp refused the build, banned the number or refused the
+	// connection, and the library publishes those from the branch that keeps the socket
+	// down.
+	//
+	// Asked when an emission marked as the last one is about to be published, and
+	// compared against that emission's `Attempt`. The mark travels with the emission and
+	// cannot be taken off it, so between the engine queueing one and the reader taking it
+	// a connect can have run and put a socket back up -- and run into a second outcome of
+	// its own. A count rather than a flag, because both of those have to be told apart
+	// from the outcome the emission in hand is about.
+	Finished() uint64
+	// Close releases the session. Events is closed before Close returns, so a reader
+	// draining it always terminates.
+	Close() error
+}
+
+// ConnectRequest is `session.connect`, decoded.
+type ConnectRequest struct {
+	// Pairing is "qr", "code" or "resume".
+	Pairing string `json:"pairing"`
+	// Phone is required by code pairing and ignored otherwise.
+	Phone string `json:"phone,omitempty"`
+	// DeviceName is what the account's linked-devices list shows. The whatsmeow engine
+	// cannot honour it per session: the library keeps device properties process-wide,
+	// so the deployment's own name is used instead.
+	DeviceName string `json:"device_name,omitempty"`
+	// Proxy is an object in the contract, not a string: decoding it as one made every
+	// connect carrying a proxy fail to parse before it reached an engine.
+	Proxy *ProxyRequest `json:"proxy,omitempty"`
+	// Groups asks for group chats alongside direct ones, and six paths select on it: a
+	// message, an unreadable message, a chat presence, a receipt whose chat is a group,
+	// and the two notifications WhatsApp sends about a group itself -- being added to
+	// one, and one changing -- are acknowledged and published nowhere when the last
+	// connect asked for direct chats only. So this is the client's switch for whether
+	// group traffic reaches it at all, and a client that stops setting it stops
+	// receiving groups rather than losing a feature it was not using.
+	//
+	// Acknowledged and dropped rather than refused, because withholding the
+	// acknowledgement would have WhatsApp redeliver every group message the account
+	// receives for as long as the session is up.
+	//
+	// It says nothing about the group *commands*, which are a different question and
+	// are served whether or not this is set: `group.info` and the eleven beside it
+	// answer. Wanting group conversation to arrive and being able to ask about or
+	// administer a group are separate, and this switch is only about the first.
+	Groups bool `json:"groups,omitempty"`
+	// HistorySync asks for the conversations the phone sends a linked device: the dump it
+	// sends on pairing, and the answers to `history.request`. Without it they are still
+	// downloaded, for the addresses and names whatsmeow keeps from them, and published
+	// nowhere.
+	HistorySync bool `json:"history_sync,omitempty"`
+	// Calls is the call half of `session.connect`.
+	Calls *CallsRequest `json:"calls,omitempty"`
+}
+
+// Validate answers the part of a connect this connector refuses whichever engine is
+// running, and it is asked above the engines for two reasons that are the same reason.
+//
+// The first is that the answer has to be one answer. A proxy URL that cannot be dialled
+// is a fact about the request, not about an engine, and two engines that spelled it
+// differently would have a client's error code depend on which one a deployment happens
+// to run.
+//
+// The second is the ordering #266 left behind. What a client asked for is recorded before
+// the engine is called, so that an instance dying inside a connect leaves the account
+// resumable; a request refused after that point would be recorded all the same, and the
+// sweep would repeat it for ever against a build that refuses it by construction. For a
+// proxy that is worse than useless: the row now carries it, so a malformed one would be
+// replayed on every sweep, each time refused, and the account would never come back.
+//
+// What is deliberately not here: whether a session is closed, and whether it has a device
+// it can use. Those are an engine's own state rather than the shape of the request, they
+// do not give the same answer twice, and a connect refused for one of them is one a later
+// sweep may well get through -- so it is recorded, and `cluster.Quarantine` is what stops
+// an account that fails for ever from being asked for for ever.
+func (r ConnectRequest) Validate() error {
+	if err := r.Proxy.validate(); err != nil {
+		return err
+	}
+	if r.Pairing != "resume" && r.Pairing != "qr" && r.Pairing != "code" {
+		return protocol.NewError(protocol.ErrorInvalidPayload,
+			fmt.Sprintf("%q is not a pairing mode this connector knows", r.Pairing))
+	}
+	// Digits rather than emptiness, because a phone the operator typed carries spaces,
+	// dashes and brackets and none of them are the number: a string of punctuation is as
+	// unpairable as no string at all, and refusing it here is refusing it before the
+	// session has changed.
+	if r.Pairing == "code" && !strings.ContainsFunc(r.Phone, func(c rune) bool { return c >= '0' && c <= '9' }) {
+		return protocol.NewError(protocol.ErrorInvalidPayload, "code pairing needs the phone number to pair")
+	}
+	return nil
+}
+
+// CallsRequest is what a session asks the connector to do about incoming calls.
+type CallsRequest struct {
+	// AutoReject has the connector refuse an incoming call rather than let it ring.
+	// The call is still published either way: a client whose policy is to refuse still
+	// wants to know somebody rang, which is the whole reason the event reaches an inbox.
+	AutoReject bool `json:"auto_reject,omitempty"`
+	// Answer has the connector carry the voice of a 1:1 call between WhatsApp and the
+	// client's browser: the offer carries an SDP, and call.accept answers it. It takes
+	// effect only on a deployment with a media port, and AutoReject wins over it.
+	Answer bool `json:"answer,omitempty"`
+}
+
+// ProxyRequest is the proxy half of `session.connect`: the address a session's traffic
+// with WhatsApp leaves through, instead of this instance's own.
+//
+// The URL carries credentials more often than not (`socks5://user:secret@host:1080` is the
+// usual shape), so it is auth state and is treated like it: it never goes into a log line,
+// an event, an error message or a reply. Only what `validate` says about it does, and that
+// never repeats it.
+type ProxyRequest struct {
+	URL string `json:"url,omitempty"`
+}
+
+// ProxySchemes are the schemes a session's proxy may use: the ones whatsmeow's own
+// `SetProxyAddress` accepts, so a URL this connector takes is one the library would have
+// taken too. `socks5h` is not among them, and not because it is worse: the library does
+// not know it, and a scheme accepted here that the pin does not is a connect answered
+// `ok` over a dial that cannot happen.
+var ProxySchemes = []string{"http", "https", "socks5"}
+
+// ProxyURL is the proxy the request asks for, or "" for a session that goes out directly.
+//
+// Absent, `null` and `{"url": ""}` are the same request and read the same way: no proxy.
+// That includes a session that had one, because a connect replaces what the last one
+// asked for rather than adding to it -- the same reading `groups` has always had.
+func (r ConnectRequest) ProxyURL() string {
+	if r.Proxy == nil {
+		return ""
+	}
+	return r.Proxy.URL
+}
+
+// validate refuses a proxy this connector could not dial, as the client's mistake.
+//
+// `invalid_payload` and not `unsupported`: the build does route through a proxy, and what
+// is wrong is the address. Every message is written here rather than passed through,
+// because the parse error Go returns quotes the URL it could not read -- credentials and
+// all -- and a reply is a frame a client stores and shows.
+func (p *ProxyRequest) validate() error {
+	if p == nil || p.URL == "" {
+		return nil
+	}
+	parsed, err := url.Parse(p.URL)
+	if err != nil {
+		return protocol.NewError(protocol.ErrorInvalidPayload, "proxy.url is not a URL")
+	}
+	known := false
+	for _, scheme := range ProxySchemes {
+		if parsed.Scheme == scheme {
+			known = true
+		}
+	}
+	if !known {
+		return protocol.NewError(protocol.ErrorInvalidPayload, fmt.Sprintf(
+			"proxy.url has to use one of %s", strings.Join(ProxySchemes, ", ")))
+	}
+	// Hostname and not Host: `socks5://:1080` has a host of ":1080" and nobody to dial.
+	if parsed.Hostname() == "" {
+		return protocol.NewError(protocol.ErrorInvalidPayload, "proxy.url names no host to dial")
+	}
+	return nil
+}

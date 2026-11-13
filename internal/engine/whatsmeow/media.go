@@ -1,0 +1,1002 @@
+package whatsmeow
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"net/url"
+	"strings"
+	"time"
+
+	wm "go.mau.fi/whatsmeow"
+	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
+	waEvents "go.mau.fi/whatsmeow/types/events"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/fazer-ai/whatsapp-connector/internal/calls"
+	"github.com/fazer-ai/whatsapp-connector/internal/media"
+	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+	"github.com/fazer-ai/whatsapp-connector/internal/store"
+)
+
+// downloadTimeout bounds the time one inbound message spends fetching its file.
+//
+// whatsmeow gives a node handler five minutes before it starts the next node's handler
+// alongside it, and the moment two run at once the order they publish in is the
+// scheduler's to decide. A media message spends this and then, at worst, two
+// deliverWaits: the message itself, and the failure that follows it. Ninety seconds
+// puts that ceiling at three and a half minutes, which is the margin that keeps a
+// session's messages in the order WhatsApp sent them.
+const downloadTimeout = 90 * time.Second
+
+// thumbnailLimit is the largest inline preview the contract carries. Measured on the
+// data: URI rather than on the bytes behind it, because the URI is what travels and
+// base64 is a third longer than what it encodes.
+const thumbnailLimit = 32 << 10
+
+// Why the file of a message is not coming. These reach an agent as the whole
+// explanation, by way of `media.download_failed`, so each one names something that
+// happened rather than the call that returned it.
+const (
+	// reasonMediaExpired is WhatsApp refusing to hand the file over at all. The key that
+	// decrypts it lapses with the file, and nothing on either side brings it back.
+	reasonMediaExpired = "media_key_expired"
+	// reasonMediaOffCDN is WhatsApp having dropped the file while the sender's phone may
+	// still hold it, which is what a message that sat in a backlog looks like from here.
+	// Told apart from the one above because they end differently: this is the failure a
+	// client can come back from, and saying the key expired when it did not would put a
+	// wrong sentence in front of an operator next to a flag telling them to ask again.
+	reasonMediaOffCDN = "media_off_cdn"
+	// reasonCorrupt is bytes that arrived and are not the ones the message describes.
+	reasonCorrupt = "integrity_check_failed"
+	// reasonUnreferenced is a media message that names no file to fetch.
+	reasonUnreferenced = "no_media_reference"
+	// reasonTooLarge is a file past what this instance keeps, whether the sender said
+	// so up front or the bytes said so on the way in.
+	reasonTooLarge = "too_large"
+	// reasonViewOnce is a file the sender meant to be seen once and then be gone. It is
+	// not a failure to download and it is published as one on purpose: the client's
+	// answer to both is the same bubble, and there is no field on the contract yet that
+	// says why this one is unavailable.
+	reasonViewOnce = "view_once"
+	// reasonNoStore is an instance with nowhere to put a file. The message is still
+	// worth publishing: its caption, its name and its size are on the event, so the
+	// client renders a bubble whose file is unavailable rather than an empty one.
+	reasonNoStore = "no_media_store"
+)
+
+// refused is a download that is not worth trying again: the bytes are gone, they do not
+// check out, or this instance will not keep them. It is the half of a failure a client
+// is told about; everything else leaves the message on the phone for WhatsApp to send
+// again.
+type refused struct {
+	reason string
+	err    error
+}
+
+func (r refused) Error() string {
+	if r.err == nil {
+		return r.reason
+	}
+	return r.reason + ": " + r.err.Error()
+}
+
+func (r refused) Unwrap() error { return r.err }
+
+// Blobs is the half of the media store a session uses. An interface so a test can make a
+// store fail without needing a filesystem that will.
+//
+// Touch is the read half and it hands back no bytes: what a session asks the store is
+// whether a file it already downloaded is still here and how long it is still promised
+// for, and a session with a descriptor in its hand is a session that can drop one.
+type Blobs interface {
+	Receive(ctx context.Context, about *media.Blob, fill func(media.File) error) (media.Blob, error)
+	Touch(id string) (media.Blob, time.Time, error)
+	MaxBlob() int64
+	TTL() time.Duration
+}
+
+// MediaOptions is where a session puts the file of an inbound message, and the address
+// it tells a client to fetch it from.
+type MediaOptions struct {
+	Blobs Blobs
+	// BaseURL is this instance's own address as the rest of the deployment reaches it.
+	// A blob lives on the disk of whoever downloaded it, so the reference has to name
+	// that instance: a URL pointing at the service in front of the fleet reaches a
+	// different one on every request and answers 404 from all but one.
+	BaseURL string
+	// SendMax is the largest file a session will send. It belongs here for the subject
+	// rather than for the store: the two are independent, and an instance given no blob
+	// root at all still sends. The zero value asks for DefaultSendMax, so an engine
+	// built without one is not an engine that refuses every file.
+	SendMax int64
+	// FetchHosts is the hosts a file to send may be fetched from. Empty is any host.
+	FetchHosts FetchHosts
+	// Calls is the media socket the voice of calls goes through. Nil turns calls off:
+	// meowcaller is not installed, no offer carries an SDP, and the call commands are
+	// answered `unsupported` whatever a connect asked for.
+	Calls *calls.Media
+}
+
+// attachment is the media part of a message: what the contract says about the file, the
+// context that came with it, and the handle whatsmeow downloads it by.
+type attachment struct {
+	content  protocol.MediaContent
+	context  *waE2E.ContextInfo
+	download wm.DownloadableMessage
+}
+
+// attachmentOf pulls the media out of a message and reports whether there is any.
+//
+// Only the five leaf types are reachable: whatsmeow has already unwrapped the envelopes
+// WhatsApp puts around a message — view once, ephemeral, a document sent with a caption
+// — before a handler sees it.
+func attachmentOf(message *waE2E.Message) (attachment, bool) {
+	switch {
+	case message.GetImageMessage() != nil:
+		part := message.GetImageMessage()
+		content := protocol.Media(protocol.MediaImage)
+		content.Mime = part.GetMimetype()
+		content.Caption = part.GetCaption()
+		content.Size = declaredSize(part.GetFileLength())
+		content.Thumbnail = thumbnailOf("image/jpeg", part.GetJPEGThumbnail())
+		return attachment{content: content, context: part.GetContextInfo(), download: part}, true
+
+	case message.GetVideoMessage() != nil:
+		// An animated GIF arrives as a video with `gifPlayback` set. The contract has no
+		// kind for it and a client renders it as the video it is.
+		part := message.GetVideoMessage()
+		content := protocol.Media(protocol.MediaVideo)
+		content.Mime = part.GetMimetype()
+		content.Caption = part.GetCaption()
+		content.Size = declaredSize(part.GetFileLength())
+		content.Duration = part.GetSeconds()
+		content.Thumbnail = thumbnailOf("image/jpeg", part.GetJPEGThumbnail())
+		return attachment{content: content, context: part.GetContextInfo(), download: part}, true
+
+	case message.GetAudioMessage() != nil:
+		// No name and no caption: WhatsApp's audio message carries neither. Inventing a
+		// filename here would beat the one the client builds from the mime type and the
+		// message id, which is the name an agent downloading it should see.
+		part := message.GetAudioMessage()
+		content := protocol.Media(protocol.MediaAudio)
+		content.Mime = part.GetMimetype()
+		content.Size = declaredSize(part.GetFileLength())
+		content.Duration = part.GetSeconds()
+		content.VoiceNote = part.GetPTT()
+		return attachment{content: content, context: part.GetContextInfo(), download: part}, true
+
+	case message.GetDocumentMessage() != nil:
+		part := message.GetDocumentMessage()
+		content := protocol.Media(protocol.MediaDocument)
+		content.Mime = part.GetMimetype()
+		content.Filename = part.GetFileName()
+		content.Caption = part.GetCaption()
+		content.Size = declaredSize(part.GetFileLength())
+		content.Thumbnail = thumbnailOf("image/jpeg", part.GetJPEGThumbnail())
+		return attachment{content: content, context: part.GetContextInfo(), download: part}, true
+
+	case message.GetStickerMessage() != nil:
+		// A sticker's preview is a PNG rather than a JPEG, and a sticker carries no
+		// caption of its own.
+		part := message.GetStickerMessage()
+		content := protocol.Media(protocol.MediaSticker)
+		content.Mime = part.GetMimetype()
+		content.Size = declaredSize(part.GetFileLength())
+		content.Thumbnail = thumbnailOf("image/png", part.GetPngThumbnail())
+		return attachment{content: content, context: part.GetContextInfo(), download: part}, true
+
+	default:
+		return attachment{}, false
+	}
+}
+
+// declaredSize is the length the sender put on the file.
+//
+// It is a claim and not a measurement — what is stored is measured on the way in — and
+// the one thing it decides is whether to start a download at all. A value that does not
+// fit is reported as unknown rather than as the negative number the conversion would
+// make of it: a size that reads as less than nothing passes every cap there is.
+func declaredSize(length uint64) int64 {
+	if length > math.MaxInt64 {
+		return 0
+	}
+	return int64(length)
+}
+
+// thumbnailOf renders an inline preview as the data: URI the contract carries, and
+// nothing at all for one that is missing or too big to travel. Losing a preview costs a
+// placeholder until the file arrives; carrying an oversized one costs every reader of
+// the stream, for a picture of something they are about to fetch anyway.
+func thumbnailOf(mime string, raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	uri := "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(raw)
+	if len(uri) > thumbnailLimit {
+		return ""
+	}
+	return uri
+}
+
+// mediaBody renders a media message, fetching its file on the way.
+//
+// A download that fails permanently is not a refusal: the message is published with no
+// reference and the reason travels behind it, because a bubble that says the file is
+// unavailable is worth more to an agent than a message that never arrives. A download
+// that may work next time is a refusal, and the message stays on the phone.
+//
+// Permanent here is about this attempt over this connection, not about the file: one of
+// the reasons is WhatsApp having dropped it while the sender's phone may still have it,
+// and that one is published as something the client may come back for.
+func (s *Session) mediaBody(ctx context.Context, event *waEvents.Message) (body, bool) {
+	part, ok := attachmentOf(event.Message)
+	if !ok {
+		return body{}, false
+	}
+	if viewOnce(event) {
+		// Never fetched, so there is nothing to keep. A blob is served for as long as
+		// anybody keeps asking for it — every hand-out puts its clock back — so storing
+		// one of these turns a file the sender expected to disappear into one the
+		// account holds indefinitely, replicated wherever its attachments go.
+		//
+		// The message still goes out: an agent seeing an unavailable attachment knows
+		// somebody sent something, which is worth more than a message WhatsApp
+		// redelivers for good and nobody ever reads. Delivering the file is a decision
+		// with a contract change behind it (a flag on the content, and a blob handed out
+		// once), and this is the side of it that can still be changed.
+		// The preview goes with it. A thumbnail is the same picture at a lower
+		// resolution and it travels inside the event, so leaving it on would put in
+		// Redis and in front of every client exactly what not storing the file was for.
+		part.content.Thumbnail = ""
+		s.log.Info().Str("message_id", event.Info.ID).Str("kind", string(part.content.Kind)).
+			Msg("publishing a view-once message without keeping the file it carried")
+		return body{
+			content: part.content, context: part.context,
+			missing: missingFile{reason: reasonViewOnce},
+		}, true
+	}
+
+	download, cancel := context.WithTimeout(ctx, s.downloadWait)
+	defer cancel()
+
+	ref, err := s.fetch(download, &part)
+	var giveUp refused
+	switch {
+	case errors.As(err, &giveUp):
+		// Kept even though there is no file, and only for this one reason. What the client
+		// is about to be invited to ask for is fetched from the coordinates on the original
+		// message, and this is the last place they exist -- so without this the invitation
+		// reaches a `message.download_media` that answers there is nothing kept for that
+		// message, which is final on the client and is the bubble the invitation was
+		// trying to save.
+		//
+		// Which is also why the invitation waits on the write rather than going out beside
+		// it. A store that refused -- a database that is not answering, a session already
+		// handed to another instance -- leaves the same dead end, reached one round trip
+		// later. The client is better told at once that the file is not coming.
+		//
+		// The size recorded here is the sender's claim rather than a measurement, because
+		// nothing was measured. It only decides whether a refetch starts at all; a sender
+		// who understated is still caught by the cap on the way in.
+		recoverable := agedOffTheCDN(err) && s.remember(event, &part)
+		s.log.Warn().Err(err).Str("kind", string(part.content.Kind)).Bool("recoverable", recoverable).
+			Msg("publishing a media message whose file did not arrive with it")
+		return body{
+			content: part.content, context: part.context,
+			missing: missingFile{reason: giveUp.reason, recoverable: recoverable},
+		}, true
+	case err != nil:
+		s.log.Warn().Err(err).Str("kind", string(part.content.Kind)).
+			Msg("withholding an acknowledgement for a media message whose file may arrive next time")
+		return body{}, false
+	}
+
+	part.content.Ref = &ref
+	// The measured length replaces the sender's claim now that there is one. They agree
+	// for every honest sender, and where they do not the client should size the file it
+	// can actually fetch.
+	part.content.Size = ref.Size
+
+	// Recorded after that, so a refetch checks the length that was actually written
+	// against the cap rather than the one the sender announced. The two only differ for
+	// a sender who understated, and that is exactly the file a lowered cap should stop
+	// before it is downloaded rather than after.
+	s.remember(event, &part)
+	return body{content: part.content, context: part.context}, true
+}
+
+// viewOnce reports whether the sender meant this file to be seen once and then be gone.
+//
+// Both halves are read because they are set by different paths: whatsmeow raises the
+// flag on the event when it unwraps one of the three view-once envelopes, and the
+// sender's own field rides on the media itself. A document and a sticker have no such
+// field, which is WhatsApp's answer to whether either can be sent this way.
+func viewOnce(event *waEvents.Message) bool {
+	return event.IsViewOnce ||
+		event.Message.GetImageMessage().GetViewOnce() ||
+		event.Message.GetVideoMessage().GetViewOnce() ||
+		event.Message.GetAudioMessage().GetViewOnce()
+}
+
+// fetch downloads the file of a media message, stores it, and returns the reference a
+// client fetches it by.
+//
+// The error it returns says what should happen to the message: a refused is permanent,
+// anything else is this instance's problem right now.
+func (s *Session) fetch(ctx context.Context, part *attachment) (protocol.MediaRef, error) {
+	if s.blobs == nil {
+		return protocol.MediaRef{}, refused{reason: reasonNoStore}
+	}
+	if declared, limit := part.content.Size, s.blobs.MaxBlob(); declared > limit {
+		// Refused before the transfer rather than after it. The sender's claim is the
+		// only measure available this early, and it is worth acting on: a file that
+		// says it is a gigabyte is one nothing here would keep.
+		return protocol.MediaRef{}, refused{
+			reason: reasonTooLarge,
+			err:    fmt.Errorf("the sender says %d bytes and this instance keeps %d", declared, limit),
+		}
+	}
+
+	if err := unfetchable(part.download); err != nil {
+		return protocol.MediaRef{}, err
+	}
+
+	// The download writes into the store's own file rather than handing bytes over, so
+	// what the far end serves is bounded by the cap on the way in instead of by a check
+	// once it is all resident. Kept aside as well as returned, because the two failures
+	// that come back through here are answered differently and one of them is not the
+	// store's: what WhatsApp said about the file decides whether the message is worth
+	// redelivering, and only the sentinels carry that.
+	var reached error
+	stored, err := s.blobs.Receive(ctx,
+		&media.Blob{Mime: part.content.Mime, Filename: part.content.Filename},
+		func(file media.File) error {
+			reached = s.download(ctx, s.current(), part.download, file)
+			return reached
+		},
+	)
+	switch {
+	case errors.Is(err, media.ErrTooLarge):
+		// The sender understated the length. Permanent for this file: the same bytes
+		// arrive on every attempt and are refused by the same cap. Read before the
+		// download's own error, because this is how that error arrives -- the cap
+		// refuses a write, and whatsmeow hands it back as a failed download.
+		return protocol.MediaRef{}, refused{reason: reasonTooLarge, err: err}
+	case reached != nil:
+		return protocol.MediaRef{}, downloadFailure(reached)
+	case err != nil:
+		// A disk that could not take this file may take the next one, and the message is
+		// worth another go rather than a bubble that says the file is gone.
+		return protocol.MediaRef{}, fmt.Errorf("store the file of a media message: %w", err)
+	}
+
+	return protocol.MediaRef{
+		Kind: protocol.MediaRefConnectorBlob, ID: stored.ID, URL: s.blobURL(stored.ID),
+		Size: stored.Size, Mime: stored.Mime, SHA256: stored.SHA256,
+		ExpiresAt: stored.StoredAt + s.blobs.TTL().Milliseconds(),
+	}, nil
+}
+
+// unfetchable reports metadata that can never describe a file, with the reason to
+// publish, and nil for metadata worth trying.
+//
+// whatsmeow answers both of these with a plain error rather than one of its sentinels,
+// so without the check they fall to the transient arm of downloadFailure: the message is
+// withheld, WhatsApp redelivers it carrying exactly the same metadata, and it fails
+// exactly the same way, for good. Checked here rather than matched on the text whatsmeow
+// writes, which is not part of its contract and changes when it likes.
+func unfetchable(part wm.DownloadableMessage) error {
+	path := part.GetDirectPath()
+	if !strings.HasPrefix(path, "/") {
+		// The path is pasted into a URL under whichever media host answers, so one that
+		// is not a path names nothing there. Reported without the value: it is a
+		// fragment of a URL to somebody's file, and nothing in a log needs it.
+		return refused{reason: reasonUnreferenced, err: errors.New("the direct path is not a path")}
+	}
+	if _, err := url.Parse(path); err != nil {
+		// A leading slash is not enough: whatsmeow pastes the whole thing into a URL and
+		// builds a request out of it, so a bad escape or a control character fails there
+		// instead, with a plain error, on every attempt forever.
+		return refused{reason: reasonUnreferenced, err: errors.New("the direct path cannot be parsed as one")}
+	}
+	// nil rather than empty, because that is the line whatsmeow draws: a nil digest is
+	// unencrypted media and it drops the key to match, while a digest that is present
+	// and empty keeps the key, takes the encrypted path, and fails the length check
+	// there with a plain error. A field encoded on the wire as empty unmarshals to a
+	// non-nil slice of length zero, so the two are told apart by nil alone.
+	if digest := part.GetFileEncSHA256(); digest != nil && len(digest) != sha256.Size {
+		return refused{
+			reason: reasonCorrupt,
+			err:    fmt.Errorf("the ciphertext digest is %d bytes and a SHA-256 is %d", len(digest), sha256.Size),
+		}
+	}
+	return nil
+}
+
+// integrityFailure reports the answers that mean the bytes on disk are not the ones the
+// message describes. whatsmeow measures these against the file it was handed, which is
+// why each of its transfers starts on an empty one (eachTransferAnew): otherwise any of
+// them could be an artefact of an earlier transfer's bytes rather than a fact about the
+// message.
+func integrityFailure(err error) bool {
+	return errors.Is(err, wm.ErrInvalidMediaHMAC) ||
+		errors.Is(err, wm.ErrInvalidMediaSHA256) ||
+		errors.Is(err, wm.ErrInvalidMediaEncSHA256) ||
+		errors.Is(err, wm.ErrInvalidUnencryptedMediaSHA256) ||
+		errors.Is(err, wm.ErrTooShortFile)
+}
+
+// downloadFailure classifies what whatsmeow said about a download.
+//
+// Only the answers that mean the same thing every time are permanent. A network that
+// was down, a media connection that could not be refreshed and a deadline that ran out
+// are all this instance's problem right now, and the message is worth another go.
+func downloadFailure(err error) error {
+	switch {
+	case errors.Is(err, wm.ErrMediaDownloadFailedWith403):
+		// WhatsApp keeps a file for a bounded time and the key that decrypts it lapses
+		// with it. Nothing about asking again brings either back.
+		return refused{reason: reasonMediaExpired, err: err}
+
+	case errors.Is(err, wm.ErrMediaDownloadFailedWith404),
+		errors.Is(err, wm.ErrMediaDownloadFailedWith410):
+		// The file is off the CDN, which the sender's phone can be asked to undo. Still a
+		// refusal: the asking is not this call's to do, and a caller that does not ask is
+		// right to treat it as final.
+		return refused{reason: reasonMediaOffCDN, err: err}
+
+	case integrityFailure(err):
+		// The bytes arrived and are not the ones the message describes. A redelivery
+		// carries the same description and downloads the same file -- and fetch has
+		// already spent a second transfer proving the description is what is wrong,
+		// rather than the file it was written into.
+		return refused{reason: reasonCorrupt, err: err}
+
+	case errors.Is(err, wm.ErrNoURLPresent), errors.Is(err, wm.ErrUnknownMediaType):
+		// The message names no file to fetch, so there is nothing a second attempt would
+		// find.
+		return refused{reason: reasonUnreferenced, err: err}
+
+	default:
+		// Masked rather than wrapped whole. whatsmeow builds the media request URL out of
+		// the direct path and the hash, and a transport failure comes back carrying that
+		// URL: it is how the ciphertext is fetched, so it belongs in a log no more than
+		// the file does. The chain is dropped with it, which costs nothing — this is the
+		// arm that means "unclassified", and nothing branches on what is in it.
+		return fmt.Errorf("download the file of a media message: %s", redact(err.Error()))
+	}
+}
+
+// blobURL is where this instance serves one blob.
+func (s *Session) blobURL(id string) string {
+	return strings.TrimSuffix(s.blobBase, "/") + "/media/" + id
+}
+
+// --- fetching the same file a second time ------------------------------------------
+
+// sameChat reports whether two addresses name one chat: the same address, or the number
+// and the LID of one person as this account was shown them. A message filed under the
+// number before the pairing was known is published under the LID afterwards, by a history
+// dump that carries the pairing, and a client asking for its file under either is asking
+// about the same conversation.
+func (s *Session) sameChat(asked, kept protocol.Address) bool {
+	if asked == kept {
+		return true
+	}
+	askedJID, askedErr := jidOf(asked)
+	keptJID, keptErr := jidOf(kept)
+	if askedErr != nil || keptErr != nil {
+		return false
+	}
+	looking, done := s.looking()
+	defer done()
+	askedAs, askedOK := s.address(looking, askedJID)
+	keptAs, keptOK := s.address(looking, keptJID)
+	return askedOK && keptOK && askedAs == keptAs
+}
+
+// remember records how to fetch this message's file again, and reports whether it did.
+//
+// The reference published with an event stops working, and on a schedule the client
+// cannot see: the blob is dropped on its TTL or evicted by the quota, and the instance
+// serving it is replaced on every deploy. Coming back for the file then needs the
+// coordinates WhatsApp wants, which are on the original message and nowhere else once
+// the event has gone out.
+//
+// A failure here is logged rather than returned. The message is going out either way --
+// with a reference that works, or with an invitation to come back for the file -- and
+// withholding it because a later refetch might not be possible trades a message that
+// arrives for one that might. What the answer decides is whether the invitation is issued
+// at all, which is the caller's to read.
+func (s *Session) remember(event *waEvents.Message, part *attachment) bool {
+	ctx, cancel := context.WithTimeout(s.ctx, s.storeLimit)
+	defer cancel()
+
+	kept := s.mediaPartOf(ctx, event, part)
+	if err := s.store.PutMediaPart(ctx, &kept, time.Now()); err != nil {
+		s.log.Warn().Err(err).Str("message_id", kept.MessageID).
+			Msg("published a file this session will not be able to fetch a second time")
+		return false
+	}
+	return true
+}
+
+// rememberPast is remember for a message out of a history dump, which is the one place a
+// message this session already knows arrives again: live and then in a dump, or in two
+// dumps. What was kept first wins, because it can only be as new as the dump's copy and
+// it may name the file already on this instance's disk, which the dump's copy cannot.
+//
+// Unlike remember, a failure is the caller's to act on: a dump's media goes out with no
+// reference, so this row is the only way its file is ever fetched.
+func (s *Session) rememberPast(
+	ctx context.Context, event *waEvents.Message, part *attachment, device string, chat protocol.Address,
+) bool {
+	ctx, cancel := context.WithTimeout(ctx, s.storeLimit)
+	defer cancel()
+
+	kept := s.mediaPartOf(ctx, event, part)
+	// Under the address the slice publishes the message under, which the slice pinned before
+	// rendering it: resolved again here, a pairing learned in between would file the row
+	// under an address the client was never shown.
+	kept.ChatKind, kept.ChatID = string(chat.Kind), chat.ID
+	// A row this message already has, under another address for what the resolver says is
+	// the same chat, gets the dump's address beside its own: the pairing that says so lives
+	// in memory, and a download after a restart only has the row to go by. Another chat that
+	// happens to hold the same id is left alone.
+	already, found, err := s.store.MediaPart(ctx, kept.MessageID)
+	if err != nil {
+		// Written without the lookup, a row under the other address would keep only the
+		// first one, and the dump would be finished with. Kept for another attempt instead.
+		s.log.Warn().Err(err).Str("message_id", kept.MessageID).
+			Msg("could not read how the file of a message out of a dump was kept")
+		return false
+	}
+	if found {
+		published := protocol.Address{Kind: protocol.AddressKind(kept.ChatKind), ID: kept.ChatID}
+		first := protocol.Address{Kind: protocol.AddressKind(already.ChatKind), ID: already.ChatID}
+		if published != first && s.sameChat(published, first) {
+			// The first address stays the row's, and is what the write holds the second to.
+			kept.AltChatKind, kept.AltChatID = kept.ChatKind, kept.ChatID
+			kept.ChatKind, kept.ChatID = already.ChatKind, already.ChatID
+		}
+	}
+	if err := s.store.KeepMediaPart(ctx, &kept, device, time.Now()); err != nil {
+		s.log.Warn().Err(err).Str("message_id", kept.MessageID).
+			Msg("could not keep how to fetch the file of a message out of a dump")
+		return false
+	}
+	return true
+}
+
+// mediaPartOf is the row that says how to fetch this message's file again.
+func (s *Session) mediaPartOf(ctx context.Context, event *waEvents.Message, part *attachment) store.MediaPart {
+	messageID := event.Info.ID
+	// Through chatOf, which is what the event was published under. Recomputing it here
+	// would be a second copy of the broadcast rule, and a copy that drifted would file a
+	// message's file under a chat the message is not in.
+	chat, _ := s.chatOf(ctx, &event.Info)
+	kept := store.MediaPart{
+		MessageID: messageID,
+		ChatKind:  string(chat.Kind), ChatID: chat.ID, Kind: string(part.content.Kind),
+		DirectPath: part.download.GetDirectPath(), MediaKey: part.download.GetMediaKey(),
+		FileEncSHA256: part.download.GetFileEncSHA256(), FileSHA256: part.download.GetFileSHA256(),
+		FileLength: part.content.Size, Mime: part.content.Mime, Filename: part.content.Filename,
+		// Not for the download, which needs only the path, the key and the digests.
+		// These are what a request to re-upload the file is addressed with once WhatsApp
+		// has dropped it, and the message is the only place they exist.
+		// The chat as it was *sent* to, which is not the one above: for a broadcast,
+		// chatOf publishes under the sender because that is where WhatsApp shows it, and
+		// a receipt addressed from that names a message WhatsApp cannot find.
+		ReceiptChat: event.Info.Chat.String(),
+		Sender:      event.Info.Sender.String(), FromMe: event.Info.IsFromMe,
+	}
+	if part.content.Ref != nil {
+		// The file is on this instance's disk, so the next caller asking for it can be
+		// answered from there instead of downloading it again. Empty for the other way
+		// into here, which is a message whose file never arrived: there is nothing to
+		// point at, and the invitation to come back for it is the whole point of the row.
+		kept.BlobID = part.content.Ref.ID
+	}
+	return kept
+}
+
+// downloadMedia is `message.download_media`: the file of a message this session already
+// published, fetched again and put in this instance's store.
+//
+// It is what stands between a blob that is gone and a message the client marks
+// unsupported for good. Which of the two happens is decided by the error code alone, so
+// each one below is chosen for what it makes the client do rather than for what
+// happened here.
+func (s *Session) downloadMedia(ctx context.Context, command *protocol.Command) (json.RawMessage, error) {
+	var body struct {
+		MessageID string            `json:"message_id"`
+		Chat      *protocol.Address `json:"chat"`
+	}
+	if err := json.Unmarshal(command.Payload, &body); err != nil {
+		return nil, protocol.NewError(protocol.ErrorInvalidPayload, "a download has to say whose file it wants")
+	}
+	if body.MessageID == "" {
+		return nil, protocol.NewError(protocol.ErrorInvalidPayload, "a download has to name the message it is fetching")
+	}
+	if s.blobs == nil {
+		// Nowhere to put the answer. Deliberately not `unsupported`: that is final on
+		// the client and marks the message unsupported for good, and an instance with
+		// no media root is a deployment somebody has to fix, not a file that is gone.
+		return nil, protocol.NewError(protocol.ErrorInternal, "this instance has nowhere to keep a file")
+	}
+
+	kept, found, err := s.store.MediaPart(ctx, body.MessageID)
+	switch {
+	case err != nil:
+		s.log.Warn().Err(err).Str("message_id", body.MessageID).Msg("could not look up how to fetch a file again")
+		return nil, protocol.NewError(protocol.ErrorInternal, "how to fetch that file could not be looked up")
+	case !found:
+		// The message never had a file, or what was kept for it has aged past what this
+		// deployment retains. Both are final: nothing about asking again brings the
+		// coordinates back, and the client is better off saying so than retrying.
+		return nil, protocol.NewError(protocol.ErrorMediaUnavailable,
+			"nothing is kept for that message to fetch its file with")
+	}
+
+	if body.Chat != nil && !s.sameChat(*body.Chat, protocol.Address{Kind: protocol.AddressKind(kept.ChatKind), ID: kept.ChatID}) &&
+		(kept.AltChatID == "" || !s.sameChat(*body.Chat, protocol.Address{Kind: protocol.AddressKind(kept.AltChatKind), ID: kept.AltChatID})) {
+		// A message id is the sender's to choose, so two chats under one account can
+		// carry the same one and the second row replaces the first. Vanishingly rare and
+		// the client keys by message id too, so it is not a case this can resolve -- but
+		// it is one this must not resolve wrongly: handing back the file would put one
+		// conversation's attachment in another's thread. The chat is optional on the
+		// command, so this only fires when the caller brought one.
+		s.log.Warn().Str("message_id", body.MessageID).
+			Msg("refusing a download whose message is filed under a different chat")
+		return nil, protocol.NewError(protocol.ErrorMediaUnavailable,
+			"what is kept for that message belongs to a different chat")
+	}
+
+	// Asked here and not earlier, which is the whole of C17 and is load bearing. Looking
+	// at a blob puts it at the back of the eviction queue, so a consultation in front of
+	// the guards above would let a caller naming the wrong chat -- one this is about to
+	// refuse -- keep alive indefinitely a file it has no right to fetch.
+	if ref, found := s.reusable(&kept); found {
+		return json.Marshal(ref)
+	}
+
+	if s.state() != "open" {
+		// The download goes out over this session's own connection: whatsmeow refreshes
+		// the media credentials on the socket, so a session that is not up fetches
+		// nothing however good the coordinates are. Retried by the client rather than
+		// given up on, which is what a connection coming back deserves.
+		//
+		// Below the reuse above on purpose: reading a file this instance already has goes
+		// out over no socket at all, and refusing it would make a reconnection cost an
+		// attachment that was never in question.
+		return nil, protocol.NewError(protocol.ErrorNotConnected, "the session is not connected to WhatsApp")
+	}
+
+	part, err := attachmentFrom(&kept)
+	if err != nil {
+		return nil, err
+	}
+	download, cancel := context.WithTimeout(ctx, s.downloadWait)
+	defer cancel()
+
+	ref, err := s.fetch(download, &part)
+	if err != nil && agedOffTheCDN(err) {
+		// WhatsApp keeps a file for a bounded time and the sender's phone often still
+		// has it. Asked for here and not on the inbound path, and on the caller's
+		// deadline rather than one this invents: see askForReupload.
+		//
+		// The first failure is what is reported if this comes to nothing. The phone
+		// declining, or not answering, says nothing the caller did not already know
+		// from the 404.
+		ref, err = s.refetchReuploaded(ctx, &kept, err)
+	}
+	if err != nil {
+		s.log.Warn().Err(err).Str("message_id", body.MessageID).Msg("could not fetch a file a second time")
+		return nil, refetchFailure(err)
+	}
+	s.rememberBlob(ctx, &kept, ref.ID)
+	return json.Marshal(ref)
+}
+
+// reusable is the file this instance already has for a message, described as a client
+// fetches it, and whether there is one to hand back at all.
+//
+// It is what issue #24 is about: the same command arriving twice used to pay for the
+// file twice and leave two copies of it on the disk, and a second copy of a file is not
+// worth anything to anybody -- the client keys by message id, the store hands out either
+// one, and the quota pays for both.
+//
+// Nothing here is trusted without being checked against the disk. The row is shared
+// across the deployment and the blob is not: a session that has moved reads an id
+// naming a file on the instance that downloaded it, and publishing that id under this
+// instance's address is a reference that answers 404 forever. So the store is asked, and
+// a no is not a failure -- it is the ordinary case the download below exists for.
+func (s *Session) reusable(kept *store.MediaPart) (protocol.MediaRef, bool) {
+	// Asked without checking the id first, because an empty one is already an id this
+	// store has no blob for: a row that kept nothing, or one written before the column
+	// existed, comes back ErrNotFound like any other and downloads, which is what this
+	// build did for every call before there was a column at all. A guard in front of it
+	// would be a second answer to a question that already has one.
+	about, touched, err := s.blobs.Touch(kept.BlobID)
+	switch {
+	case errors.Is(err, media.ErrNotFound):
+		// Swept, evicted, on an instance this session no longer runs on, or never there
+		// at all. The ordinary case, and it is not worth a line in the log: it is what
+		// the download below is for.
+		return protocol.MediaRef{}, false
+	case err != nil:
+		s.log.Warn().Err(err).Str("message_id", kept.MessageID).
+			Msg("could not tell whether the file of a message is still on this instance")
+		return protocol.MediaRef{}, false
+	}
+
+	if about.Size > s.blobs.MaxBlob() {
+		// A cap lowered under a file that is already here stops it, the same as it stops
+		// one arriving. That intention is written down in mediaBody, which records the
+		// length it measured rather than the one the sender announced so that a lowered
+		// cap refuses the file before a transfer rather than after it -- and reuse in
+		// front of the cap would quietly undo it for every file on the disk.
+		//
+		// Measured against the store's own length rather than the row's, which is not
+		// always a measurement: a message whose file WhatsApp had already dropped is
+		// filed with the sender's claim, because nothing was measured, and a download
+		// that succeeded later leaves that claim in place. Read off the row, a sender who
+		// understated would be served from the disk while the same file arriving is
+		// stopped by the cap on the way in, and the two paths would disagree.
+		return protocol.MediaRef{}, false
+	}
+
+	if digest := hex.EncodeToString(kept.FileSHA256); len(kept.FileSHA256) > 0 &&
+		about.SHA256 != "" && digest != about.SHA256 {
+		// The row says one file and the blob holds another. For an honest message the
+		// two digests are one value -- WhatsApp puts the plaintext digest on the message
+		// and the store takes its own over the bytes it wrote -- so a disagreement means
+		// the id on this row is not this row's file, and handing it over would put one
+		// conversation's attachment in another's thread past a chat guard that cannot see
+		// it. Downloaded instead, and the write-back below then points the row at the
+		// file that does belong to it.
+		s.log.Warn().Str("message_id", kept.MessageID).
+			Msg("refusing to reuse a file whose digest is not the one the message describes")
+		return protocol.MediaRef{}, false
+	}
+
+	return protocol.MediaRef{
+		Kind: protocol.MediaRefConnectorBlob, ID: about.ID, URL: s.blobURL(about.ID),
+		Size: about.Size, Mime: about.Mime, SHA256: about.SHA256,
+		// From the touch and not from `about.StoredAt`, which is the two clocks a blob is
+		// measured by: the sweep drops on the modification time, which being asked for
+		// renews, while `StoredAt` is when the write finished and nothing renews it. A
+		// blob written a day ago and collected an hour ago is served for another day, and
+		// publishing `StoredAt + TTL` for it hands back a reference that lapsed hours ago
+		// -- to a client whose answer to a lapsed reference is to ask for the file again,
+		// which is this very command.
+		ExpiresAt: touched.Add(s.blobs.TTL()).UnixMilli(),
+	}, true
+}
+
+// rememberBlob points a message's row at the file this instance just downloaded, so the
+// next caller is answered off the disk.
+//
+// Conditional on the row being the one this command read, and that is not a formality:
+// the download it follows can have been in flight for the whole media timeout, and the
+// inbound pump runs beside the executor that serialises commands. A message id is the
+// sender's to choose, so the same one arriving in another chat replaces the row inside
+// that window -- and this write landing on the key alone would file chat A's file as
+// chat B's, where the chat guard cannot catch it because the row it checks is chat B's.
+//
+// A failure is logged rather than returned. The file was fetched and the answer is a good
+// one; what is lost is only that the next caller pays for the download again, which is
+// what every caller paid before this existed.
+func (s *Session) rememberBlob(ctx context.Context, kept *store.MediaPart, blobID string) {
+	if err := s.store.RememberBlob(ctx, blobID, kept); err != nil {
+		s.log.Warn().Err(err).Str("message_id", kept.MessageID).
+			Msg("could not record which file was kept for a message, so the next caller will fetch it again")
+	}
+}
+
+// refetchReuploaded asks the sender's phone to upload the file again and fetches what it
+// answers with, and hands back the download's own failure when that comes to nothing.
+func (s *Session) refetchReuploaded(
+	ctx context.Context, kept *store.MediaPart, gone error,
+) (protocol.MediaRef, error) {
+	fresh, err := s.askForReupload(ctx, kept)
+	if err != nil {
+		s.log.Info().Err(err).Str("message_id", kept.MessageID).
+			Msg("a file WhatsApp had dropped was not uploaded again")
+		if !answeredNo(err) {
+			// The phone was not reached, or did not answer in time. That says nothing
+			// about the file, so it must not come back as the 404 does: `gone` is final
+			// on the client, and this is the case where asking once more -- when the
+			// phone is back on, when the socket is up -- is exactly what recovers the
+			// attachment.
+			return protocol.MediaRef{}, err
+		}
+		// The phone was asked and answered, and the answer was no. Reported as what the
+		// download said, which is the same thing said first: the file is gone.
+		return protocol.MediaRef{}, gone
+	}
+	part, err := attachmentFrom(kept)
+	if err != nil {
+		return protocol.MediaRef{}, gone
+	}
+	part.download = fresh
+
+	// Written back before the bytes are fetched, so the next caller starts from the path
+	// that works. The blob this is about to make is dropped on its TTL or evicted by the
+	// quota, and without this the request after that would spend the 404 and the wait on
+	// the phone all over again -- for a file WhatsApp is now serving perfectly well.
+	//
+	// The path alone, and only while the row is still the one this read. Waiting on a
+	// phone takes as long as thirty seconds, and an inbound handler can write a newer row
+	// in that time; a whole row written back would put this snapshot's chat and
+	// coordinates over the fresher ones.
+	if err := s.store.RefreshDirectPath(ctx, kept.MessageID, fresh.GetDirectPath(), kept.StoredAt); err != nil {
+		// Logged, not returned. The file is about to be fetched either way; refusing it
+		// because the next caller may have to ask twice trades a file that arrives for
+		// one that might.
+		s.log.Warn().Err(err).Str("message_id", kept.MessageID).
+			Msg("fetched a file from a fresh path this session will not remember")
+	}
+
+	// Its own window, and not what is left of the one the first attempt spent: the wait
+	// on the phone has already taken part of the caller's deadline, and a download given
+	// what remains of it would be cut short by how long the phone took rather than by how
+	// big the file is. Bounded by the caller's deadline all the same, which is the
+	// context this derives from.
+	download, cancel := context.WithTimeout(ctx, s.downloadWait)
+	defer cancel()
+
+	ref, err := s.fetch(download, &part)
+	if err != nil {
+		s.log.Warn().Err(err).Str("message_id", kept.MessageID).
+			Msg("a file the sender's phone uploaded again could not be fetched")
+		return protocol.MediaRef{}, err
+	}
+	return ref, nil
+}
+
+// answeredNo is the phone having been asked and having declined, which is the only kind
+// of failure on this path that is final.
+//
+// Everything else -- a socket that was down, a phone that never woke up, an answer that
+// could not be read -- says nothing about the file. Reported as final it would tell an
+// agent the attachment is gone on the strength of the phone having been asleep, and the
+// client would never ask again; reported as this instance's problem, the client comes
+// back and the phone may be on by then.
+func answeredNo(err error) bool {
+	return errors.Is(err, errNoReupload) || errors.Is(err, wm.ErrMediaNotAvailableOnPhone)
+}
+
+// agedOffTheCDN is the failure worth asking the sender's phone about.
+//
+// 403 is not among them, and that is the whole distinction. A 403 is the key having
+// lapsed, and nothing the phone does brings it back; a 404 or a 410 is the file having
+// been dropped from the CDN, which is the case this recovery exists for and the shape a
+// message that sat in a backlog arrives in. downloadFailure has already drawn that line,
+// and this reads its answer rather than the sentinels behind it.
+func agedOffTheCDN(err error) bool {
+	var giveUp refused
+	return errors.As(err, &giveUp) && giveUp.reason == reasonMediaOffCDN
+}
+
+// refetchFailure turns what fetch decided into what the client should do about it.
+//
+// The split is the same one the inbound path makes, read the other way round: what is
+// permanent there is what the client should stop asking for here, and everything else is
+// worth another go.
+func refetchFailure(err error) error {
+	var giveUp refused
+	if !errors.As(err, &giveUp) {
+		// A network, a deadline or a disk. None of them says anything about the file, so
+		// the client retries and then surfaces a job somebody looks at, rather than
+		// telling an agent the attachment is gone.
+		return protocol.NewError(protocol.ErrorInternal, "the file could not be fetched")
+	}
+	if giveUp.reason == reasonTooLarge {
+		return protocol.NewError(protocol.ErrorMediaTooLarge, giveUp.reason)
+	}
+	return protocol.NewError(protocol.ErrorMediaUnavailable, giveUp.reason)
+}
+
+// attachmentFrom rebuilds enough of a media message to download it again.
+//
+// Only what fetch reads: the coordinates, the size it checks against the cap, and the
+// mime and name the blob is stored under. What is missing -- the caption, the preview,
+// how long the audio runs -- was never kept, because the client already has all of it
+// from the event and the answer to this command is a reference and nothing else.
+func attachmentFrom(kept *store.MediaPart) (attachment, error) {
+	download, err := downloadableOf(kept)
+	if err != nil {
+		return attachment{}, err
+	}
+	content := protocol.Media(protocol.MediaKind(kept.Kind))
+	content.Mime = kept.Mime
+	content.Filename = kept.Filename
+	content.Size = kept.FileLength
+	return attachment{content: content, download: download}, nil
+}
+
+// downloadableOf rebuilds the message whatsmeow downloads from.
+//
+// The concrete type carries half the address: whatsmeow reads the media type off it, and
+// asks a different endpoint for each. So the kind is not a label on the row, it is part
+// of what makes the fetch work.
+func downloadableOf(kept *store.MediaPart) (wm.DownloadableMessage, error) {
+	path, key := proto.String(kept.DirectPath), kept.MediaKey
+	enc, plain, mime := kept.FileEncSHA256, kept.FileSHA256, proto.String(kept.Mime)
+
+	switch protocol.MediaKind(kept.Kind) {
+	case protocol.MediaImage:
+		return &waE2E.ImageMessage{
+			DirectPath: path, MediaKey: key, FileEncSHA256: enc, FileSHA256: plain, Mimetype: mime,
+		}, nil
+	case protocol.MediaVideo:
+		return &waE2E.VideoMessage{
+			DirectPath: path, MediaKey: key, FileEncSHA256: enc, FileSHA256: plain, Mimetype: mime,
+		}, nil
+	case protocol.MediaAudio:
+		return &waE2E.AudioMessage{
+			DirectPath: path, MediaKey: key, FileEncSHA256: enc, FileSHA256: plain, Mimetype: mime,
+		}, nil
+	case protocol.MediaDocument:
+		return &waE2E.DocumentMessage{
+			DirectPath: path, MediaKey: key, FileEncSHA256: enc, FileSHA256: plain, Mimetype: mime,
+			FileName: proto.String(kept.Filename),
+		}, nil
+	case protocol.MediaSticker:
+		return &waE2E.StickerMessage{
+			DirectPath: path, MediaKey: key, FileEncSHA256: enc, FileSHA256: plain, Mimetype: mime,
+		}, nil
+	}
+	// A row this build cannot read is a row an older or a newer one wrote, and guessing a
+	// type would ask WhatsApp for the file under the wrong endpoint.
+	return nil, protocol.NewError(protocol.ErrorMediaUnavailable,
+		fmt.Sprintf("what is kept for that message is a %q, which this connector cannot fetch", kept.Kind))
+}
+
+// downloadOverClient fetches a message's file into the store's file through whatsmeow,
+// each transfer into an empty file.
+func downloadOverClient(ctx context.Context, client *wm.Client, part wm.DownloadableMessage, file media.File) error {
+	return client.DownloadToFile(ctx, part, eachTransferAnew{file}) //nolint:wrapcheck // classified by downloadFailure, which needs the sentinels
+}
+
+// eachTransferAnew empties the file before every transfer whatsmeow writes into it.
+//
+// whatsmeow walks the media hosts, and retries each one, writing into the one file it was
+// handed (#90). Between hosts it neither rewinds nor truncates, so a host that serves bytes
+// the message does not describe -- a failure that does not stop the walk -- leaves them in
+// front of the next host's transfer. Every length worked out afterwards is that transfer's,
+// measured against a file holding both: the MAC is read from the wrong offset and a good
+// file is announced as corrupt, permanently. Between retries it rewinds without
+// truncating, which leaves a longer earlier attempt's tail behind an unencrypted file.
+//
+// Each transfer is one `io.Copy` into the file (`downloadMediaToFile`), and `io.Copy`
+// hands the whole of it to `ReadFrom` when the destination has one. So a transfer is
+// exactly one call here, whichever loop made it, and it starts on an empty file. Nothing
+// else whatsmeow does to the file goes through `ReadFrom`: the MAC check and the hashing
+// read it, and the decryption writes it block by block with `WriteAt`.
+//
+// The store's file is embedded as the interface, so this has the methods File asks for
+// and `ReadFrom`, and nothing that would reach the descriptor past the store's cap: the
+// copy below writes through the file's own `Write`. upstream_test.go fails the day the
+// transfer stops being one `io.Copy`.
+type eachTransferAnew struct {
+	media.File
+}
+
+func (f eachTransferAnew) ReadFrom(transfer io.Reader) (int64, error) {
+	if err := f.Truncate(0); err != nil {
+		return 0, fmt.Errorf("empty the file for a transfer: %w", err)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return 0, fmt.Errorf("rewind the file for a transfer: %w", err)
+	}
+	return io.Copy(struct{ io.Writer }{f.File}, transfer) //nolint:wrapcheck // whatsmeow's own transfer, classified by its caller
+}

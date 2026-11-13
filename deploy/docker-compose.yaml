@@ -1,0 +1,63 @@
+# [Marca] PortoMicro-Soluções em websistemas
+# [Link] https://portomicro.com.br
+#
+# Instalacao local do fazer.ai WhatsApp Connector (fazer-ai/whatsapp-connector).
+# Imagem construida a partir do Dockerfile do proprio repositorio.
+#
+#   docker compose -f deploy/docker-compose.yaml --env-file deploy/.env up -d
+#   docker compose -f deploy/docker-compose.yaml --env-file deploy/.env logs -f connector
+#
+# Para ligar num Chatwoot fazer.ai, aponte REDIS_URL para o Redis usado pelo Chatwoot
+# (mesmo servidor e mesma senha) e preencha WAC_ADVERTISE_URL com o endereco pelo qual
+# o Chatwoot alcanca este conector para buscar midia.
+
+name: whatsapp-connector
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ['sh', '-c', 'redis-server --requirepass "$$REDIS_PASSWORD"']
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?defina REDIS_PASSWORD em deploy/.env}
+    volumes:
+      - redis:/data
+    healthcheck:
+      test: ['CMD-SHELL', 'redis-cli -a "$$REDIS_PASSWORD" ping | grep -q PONG']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  connector:
+    image: ${WAC_IMAGE:-portomicro/portozzap-connect:latest}
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    # SIGTERM devolve as sessoes ao Redis antes de sair
+    stop_grace_period: 30s
+    environment:
+      REDIS_URL: redis://redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?defina REDIS_PASSWORD em deploy/.env}
+      # jogador sobrio: whatsmeow pareia de verdade; use WAC_ENGINE=fake para testar sem celular
+      WAC_ENGINE: ${WAC_ENGINE:-whatsmeow}
+      # SQLite basta para uma instancia; para varias, use Postgres
+      WAC_DATABASE_URL: sqlite:/data/connector.db
+      WAC_MEDIA_ROOT: /data/media
+      WAC_MEDIA_TOKEN: ${WAC_MEDIA_TOKEN:?defina WAC_MEDIA_TOKEN em deploy/.env}
+      WAC_HTTP_ADDR: ':8080'
+      WAC_LOG_LEVEL: ${WAC_LOG_LEVEL:-info}
+      # URL que o Chatwoot usa para baixar a midia recebida (fora de container, o IP interno
+      # nao serve). Descomente ao integrar com o Chatwoot:
+      # WAC_ADVERTISE_URL: ${WAC_ADVERTISE_URL}
+      # Chamadas de voz: exigem porta UDP publicada e IP publico acessivel pelo navegador
+      # WAC_CALLS_UDP_PORT: '40000'
+      # WAC_CALLS_PUBLIC_IP: ${WAC_CALLS_PUBLIC_IP}
+    ports:
+      - '8085:8080'
+    volumes:
+      - connector:/data
+
+volumes:
+  redis:
+  connector:

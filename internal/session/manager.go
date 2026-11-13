@@ -1,0 +1,2359 @@
+package session
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"slices"
+	"sort"
+	"sync"
+	"time"
+
+	"github.com/rs/zerolog"
+
+	"github.com/fazer-ai/whatsapp-connector/internal/cluster"
+	"github.com/fazer-ai/whatsapp-connector/internal/engine"
+	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+	"github.com/fazer-ai/whatsapp-connector/internal/store"
+	"github.com/fazer-ai/whatsapp-connector/internal/transport"
+)
+
+// Manager keeps the sessions this instance owns, routes commands to them, and keeps
+// their leases alive.
+//
+// It is the layer that decides ownership: a session exists here only while the lease
+// is held, and losing the lease tears it down rather than letting it publish under an
+// epoch that has moved on.
+type Manager struct {
+	instance   string
+	engine     engine.Engine
+	store      *store.Container
+	leases     *cluster.Leases
+	quarantine *cluster.Quarantine
+	publisher  transport.Publisher
+	watch      Watch
+	replier    transport.Replier
+	ledger     Ledger
+	newID      IDFunc
+	now        func() time.Time
+	// retireRetry is how long a session waits before saying again that it is finished
+	// with. A field so the tests that drive that path do not wait on the real one.
+	retireRetry time.Duration
+	log         zerolog.Logger
+
+	mu       sync.RWMutex
+	sessions map[string]*Session
+
+	// handing names the accounts an adoption or a hand-back is working on, and keeps the
+	// two off each other. Both go [look at the map, talk to Redis, change the map], on
+	// different goroutines -- adoptions on the answer loop, the sweep on the heartbeat --
+	// and interleaved the release lands after the acquisition and deletes the lease the
+	// session that just started is running under: `cluster.Release` matches on the
+	// instance and nothing else, so it cannot tell one of this instance's leases from the
+	// next one. A peer can then take an account whose socket is still open here, which is
+	// the one thing the lease exists to prevent.
+	//
+	// By account and not one lock for the manager: an adoption holds its account for as
+	// long as a store read takes, and a fleet coming up has a wake for every account it
+	// owns. One lock, and a queue of wakes would keep the sweep from ever taking a turn --
+	// retired sessions renewed for as long as the backlog lasts, which is this feature
+	// not happening at all.
+	//
+	// The heartbeat never waits on it either way: a session the sweep finds busy is swept
+	// on the next tick.
+	handingMu   sync.Mutex
+	handingBusy map[string]struct{}
+
+	// newly is the sessions adopted since the loop last asked, waiting to have what
+	// their previous owner left pending drained before anything newer is read for them.
+	//
+	// It is what triggers a drain, and not a predicate about a command in hand: a
+	// session is on it both because it was just adopted and because something was left
+	// pending for it, and those two want opposite answers for a command arriving now.
+	// Asked as "may this one be carried out", it holds back every command for a session
+	// adopted a moment ago.
+	newlyMu sync.Mutex
+	newly   []string
+
+	// orphans are leases of sessions this instance has stopped and could not hand back.
+	// The Redis key still names this instance, and every wake for such a session is
+	// answered "owned elsewhere" and acknowledged, so nobody runs it until the key
+	// expires. Kept here so the next tick tries the release again.
+	//
+	// The value says the hand-back has been marked in Redis for peers to read, which is
+	// what keeps the mark at one round trip per hand-back rather than one per attempt --
+	// and what makes a mark that did not land be tried again rather than assumed.
+	orphanMu sync.Mutex
+	orphans  map[string]bool
+
+	// stopsInFlight are the stale sessions StopStale is still taking down. They are out of
+	// the map already, so StopAll waits on this rather than finding them there.
+	stopsInFlight sync.WaitGroup
+
+	// adoptedForDelete are the accounts this instance opened in order to serve a
+	// `session.delete` that has not been carried out yet, and the number of commands the
+	// session had answered when the teardown was queued. An entry is the connector saying
+	// "this account is here for one command"; the count is what later says nothing else
+	// came to want it.
+	//
+	// Keyed by sid and holding the session itself, because the pointer is the only thing
+	// that survives the account being handed back and adopted again under this instance:
+	// a hand-back matched on sid alone would stop the session that replaced the one it
+	// was about.
+	forDeleteMu sync.Mutex
+	forDelete   map[string]adoptedForDelete
+
+	// answers is the commands this manager carries out itself, waiting on the goroutine
+	// that carries them out.
+	//
+	// A session's commands are queued on that session and run on its own goroutine, and
+	// have been all along. These three -- a wake, a ping, and the refusal of a session
+	// whose queue is full -- were the ones the manager answered inline, on whichever
+	// goroutine dispatched. That goroutine is the one that renews every lease this
+	// instance holds, and all three block on I/O: a wake reads the store and opens the
+	// engine, and every one of them ends in a round trip to Redis to retire the command.
+	answers chan answer
+}
+
+// answer is one command this manager owns, and the work that finishes it.
+type answer struct {
+	delivery *transport.Delivery
+	give     func(context.Context, *transport.Delivery)
+}
+
+// DefaultAnswerDepth is how many commands may wait on the manager's own goroutine.
+//
+// A whole claim batch with room to spare, for the same reason DefaultQueueDepth is: a
+// reclaim pass hands over what it took in one go, and the goroutine has had no turn
+// while it did. Smaller than a session's queue because only three kinds of command
+// reach here and a wake is the only slow one, and because what does not fit is not
+// refused but left pending, which costs a claim delay rather than an answer.
+const DefaultAnswerDepth = 64
+
+// ManagerConfig is what a manager needs.
+type ManagerConfig struct {
+	Instance  string
+	Engine    engine.Engine
+	Leases    *cluster.Leases
+	Publisher transport.Publisher
+	Replier   transport.Replier
+	// Watch is told what this layer measured. Nil is nobody watching.
+	Watch Watch
+	// Ledger is where a command's outcome is remembered. Leaving it out turns the
+	// idempotency invariant off, which only a test that is not exercising it should do.
+	Ledger Ledger
+	// Store is where every session this manager owns records what its client asked for.
+	// Leaving it out turns that record off, which only a test that is not exercising it
+	// should do: a deployment without it pairs accounts that nothing says should be in
+	// the air, and the sweep that brings them back reads an empty list. That was #266,
+	// and it was invisible because the one engine that did write this made it look like
+	// the connector did.
+	Store *store.Container
+	// Quarantine is the fleet's record of the sessions that keep failing to come back.
+	// Leaving it out turns the backoff off, which only a test that is not exercising it
+	// should do: without it an account that cannot connect is asked for again at the
+	// sweep's own rate, forever.
+	Quarantine *cluster.Quarantine
+	NewID      IDFunc
+	Now        func() time.Time
+	Logger     zerolog.Logger
+	// AnswerDepth bounds how many commands wait on the manager's own goroutine. The
+	// zero value asks for DefaultAnswerDepth.
+	AnswerDepth int
+	// RetireRetry is how long a session waits before saying again that it is finished
+	// with, when the first attempt did not reach the stream. Zero asks for the default.
+	RetireRetry time.Duration
+}
+
+// NewManager returns a manager owning no sessions yet.
+func NewManager(cfg *ManagerConfig) *Manager {
+	if cfg.Now == nil {
+		cfg.Now = time.Now
+	}
+	if cfg.AnswerDepth <= 0 {
+		cfg.AnswerDepth = DefaultAnswerDepth
+	}
+	manager := &Manager{
+		instance:    cfg.Instance,
+		engine:      cfg.Engine,
+		leases:      cfg.Leases,
+		quarantine:  cfg.Quarantine,
+		store:       cfg.Store,
+		publisher:   cfg.Publisher,
+		watch:       cfg.Watch,
+		replier:     cfg.Replier,
+		ledger:      cfg.Ledger,
+		newID:       cfg.NewID,
+		now:         cfg.Now,
+		retireRetry: cfg.RetireRetry,
+		log:         cfg.Logger,
+		sessions:    make(map[string]*Session),
+		orphans:     make(map[string]bool),
+		forDelete:   make(map[string]adoptedForDelete),
+		handingBusy: make(map[string]struct{}),
+		answers:     make(chan answer, cfg.AnswerDepth),
+	}
+	return manager
+}
+
+// running is every session this instance holds, by sid, as it stands now.
+func (m *Manager) running() map[string]*Session {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	sessions := make(map[string]*Session, len(m.sessions))
+	for sid, session := range m.sessions {
+		sessions[sid] = session
+	}
+	return sessions
+}
+
+// SIDs lists the sessions this instance is running, which is what the command reader
+// subscribes to.
+func (m *Manager) SIDs() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	sids := make([]string, 0, len(m.sessions))
+	for sid := range m.sessions {
+		sids = append(sids, sid)
+	}
+	return sids
+}
+
+// Count is how many sessions this instance runs, for the registry and `admin.ping`.
+func (m *Manager) Count() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.sessions)
+}
+
+// AdoptTimeout bounds the store and lease work one adoption does.
+//
+// Sized against the defaults it runs under: a 30s lease renewed every 5s. A single
+// adoption may delay one heartbeat and no more, and an adoption that runs out is
+// retried, because the wake it came from is left unacknowledged and reclaimed.
+const AdoptTimeout = 5 * time.Second
+
+// releaseTimeout bounds one round trip of hand-back work: the release after an adoption
+// that could not finish, and the mark that goes in front of a stop. Short, because
+// nothing waits on either and the lease expires on its own anyway.
+const releaseTimeout = 2 * time.Second
+
+// Adopt takes a session over: wins the lease, opens it on the engine, and starts it.
+// It returns cluster.ErrNotOwner when another instance holds it, which is the ordinary
+// answer in a fleet and not a failure.
+func (m *Manager) Adopt(ctx context.Context, sid string) (*Session, error) {
+	session, _, err := m.adopt(ctx, sid, wanted)
+	return session, err
+}
+
+// Why an adoption is being made, which decides what it does to the list of accounts held
+// for a teardown. The two are not symmetrical and cannot be inferred from anything the
+// adoption itself can see.
+const (
+	// wanted is somebody asking for the account to be in the air: a wake, the resume
+	// sweep. An undoing waiting for a tick is called off, and it has to happen under the
+	// same turn as the adoption -- released first, the heartbeat takes the turn, finds the
+	// registration still there and stops a session the wake is about to be told is running.
+	wanted = false
+	// toTearDown is `takeForDelete`. It registers the account it opens, under the same
+	// lock that publishes the session, because a command dispatched on another goroutine
+	// can be carried out the instant the session is visible: registered afterwards, that
+	// command's report would find nothing to cancel and the teardown's refusal would then
+	// take a used account as its baseline.
+	toTearDown = true
+)
+
+// adopt is Adopt, and reports whether this call is the one that opened the session.
+//
+// Only the caller can know what the adoption was for, and only this function can know
+// whether there was one: Adopt hands back the session that is already running, with no
+// error and nothing to tell the two apart, which is right for every caller that just
+// wants the account in the air. `takeForDelete` is the one that needs more, because an
+// adoption it made to serve a teardown has no owner if the teardown does not run, while
+// one it merely found belongs to whoever asked for it.
+func (m *Manager) adopt(ctx context.Context, sid string, forTeardown bool) (*Session, bool, error) {
+	if !m.tryHoldHanding(sid) {
+		// The heartbeat is handing this very account back. Waiting for it would hold every
+		// wake and ping behind it on this goroutine, and what is being waited for is an
+		// account this instance is giving up: the wake is left pending, and whoever reads
+		// it next finds an account nobody owns.
+		m.log.Info().Str("sid", sid).
+			Msg("a wake found an account this instance is handing back; leaving it pending")
+		return nil, false, errLeaving
+	}
+	defer m.dropHanding(sid)
+
+	m.mu.RLock()
+	existing, running := m.sessions[sid]
+	m.mu.RUnlock()
+	if running {
+		if existing.leaving() {
+			// On its way out, whether or not that is settled yet: the event saying the
+			// engine finished with it may still be going out, a command it took before
+			// the door shut may not have answered, or the heartbeat may simply not have
+			// come round.
+			//
+			// Left pending rather than answered, and rather than handed back here to make
+			// room for a fresh session. Answering with it acknowledges the wake, and the
+			// commands behind it are then refused by a door this instance is about to
+			// stop being the owner of. Handing it back and taking it again in one step is
+			// worse: nothing keeps the instance that just let go from winning the account
+			// straight back, and for a build WhatsApp will not talk to that is the whole
+			// point -- the retry has to be free to land on a peer whose image can succeed,
+			// and it cannot if the instance that cannot has already taken it. The sweep
+			// hands the account back on the next tick, and the wake is then a wake for an
+			// account nobody owns.
+			m.log.Info().Str("sid", sid).
+				Msg("a wake found an account this instance is finishing with; leaving it pending")
+			return nil, false, errLeaving
+		}
+		if !forTeardown {
+			// Somebody wants this account up, and this is the only place that can be said
+			// while the turn for the account is still held.
+			m.forgetAdoptedForDelete(sid, nil)
+		}
+		return existing, false, nil
+	}
+
+	// Bounded, and bounded around the I/O only. Commands are dispatched on the same
+	// goroutine that renews every lease this instance holds, so a store that blocks here
+	// stops all of them from being renewed: their leases expire, peers acquire the
+	// accounts, and the sockets this instance still holds open go on talking to WhatsApp.
+	// A session that fails to start is one wake; a renewal that never runs is every
+	// session on the instance.
+	//
+	// The session itself is built on the caller's context, which is the instance's
+	// lifetime and has to outlive this.
+	io, cancelIO := context.WithTimeout(ctx, AdoptTimeout)
+	defer cancelIO()
+
+	lease, err := m.leases.Acquire(io, sid)
+	if err != nil {
+		return nil, false, err
+	}
+	// Won again, so a hand-back still queued for it is now about a live lease.
+	m.forgetOrphan(sid)
+
+	engineSession, err := m.engine.Open(io, sid)
+	if err != nil {
+		// The lease is held for a session that cannot run. Holding it would keep every
+		// other instance from trying, so it goes back.
+		//
+		// Bounded on its own, and detached from the caller: the reason the adoption
+		// failed is often the reason Redis is slow, and an unbounded cleanup would spend
+		// the deadline this function just enforced on retries nobody is waiting for.
+		//
+		// Through abandon, so a hand-back that does not get through is tried again rather
+		// than left as a key naming an instance that is running nothing.
+		release, cancelRelease := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
+		// Struck before the account goes back, for the same reason the sweep strikes a
+		// retired one: this is the connector failing to bring an account up, and the
+		// backoff exists to pace exactly that. It was the one door into the quarantine
+		// that never knocked -- a session that fails to resume strikes it, a retired one
+		// swept strikes it, and one that never opened at all accrued nothing. So the wake
+		// behind it was tried again every claim beat, for as long as the state lasted,
+		// which is the loop #241 is about: the cost is not the entry left pending, it is
+		// this attempt repeating against an account that cannot come up.
+		m.failing(release, sid)
+		m.abandon(release, sid)
+		cancelRelease()
+		return nil, false, err
+	}
+
+	// Detached from the caller on purpose. The context that reaches Adopt bounds the
+	// work of adopting, and the caller may hand in one that expires in seconds to keep a
+	// slow store off the goroutine that renews leases. A session built on that context
+	// would be torn down along with it, which is a connector that pairs an account and
+	// drops it. Sessions end when StopAll or a lost lease ends them, and nothing else.
+	// The lifetime the callbacks below run under, for the same reason the session gets
+	// it: they fire from the pump and the executor long after this call has returned.
+	living := context.WithoutCancel(ctx)
+	// Declared ahead of the literal so the callbacks below can name the session they
+	// belong to. Nothing fires before the assignment: the executor runs a command only
+	// once somebody has been handed this pointer and offered it one.
+	var session *Session
+	// This session's own handle on the store, made here because the manager is where a
+	// session begins and there is nowhere else both this layer and the engine can be
+	// handed the same one: the engine builds its own inside `Open`. Two handles for one
+	// sid is not two fences over one device -- they share the `Ownership` arbiter, so an
+	// instance that lost the lease is refused through either -- and what this one writes
+	// is the client's request, which has no second writer to race.
+	var scoped *store.Scoped
+	if m.store != nil {
+		scoped = m.store.For(sid)
+	}
+	session = New(living, &Config{
+		Instance: m.instance, Lease: lease, Leases: m.leases, Engine: engineSession, Store: scoped,
+		Publisher: m.publisher, Replier: m.replier, Ledger: m.ledger, Watch: m.watch,
+		NewID: m.newID, Now: m.now, Logger: m.log,
+		Undrained: func() { m.undrained(sid) }, RetireRetry: m.retireRetry,
+		Connected: func() { m.working(living, sid) }, ResumeFailed: func() { m.failing(living, sid) },
+		AfterCommand: func(code protocol.ErrorCode, teardown, happened bool) {
+			m.afterCommand(sid, session, code, teardown, happened)
+		},
+	})
+
+	m.mu.Lock()
+	// Adopt can be reached twice for one session (a wake plus a claim), and the second
+	// caller must not replace a running session with a second one publishing under the
+	// same epoch.
+	if winner, ok := m.sessions[sid]; ok {
+		m.mu.Unlock()
+		session.Stop()
+		if !forTeardown {
+			m.forgetAdoptedForDelete(sid, nil)
+		}
+		return winner, false, nil
+	}
+	m.sessions[sid] = session
+	if forTeardown {
+		// Under the same lock as the insert, for the reason `toTearDown` gives: a command
+		// dispatched on the reader's goroutine can be carried out the instant this session
+		// is visible, and its report has to find a registration to cancel.
+		m.forDeleteMu.Lock()
+		m.forDelete[sid] = adoptedForDelete{session: session}
+		m.forDeleteMu.Unlock()
+	}
+	// Under the same lock as the insert, and this is the ordering the whole file turns
+	// on: between the two there used to be a moment where the session was running and
+	// not yet waiting to be drained. Nothing could observe it while adoption ran on the
+	// reader's own goroutine; the moment it does not, a reader looking into that gap
+	// would find the session in SIDs, miss it among the newly adopted, and read `>` for
+	// it ahead of everything its previous owner left pending.
+	m.newlyMu.Lock()
+	m.newly = append(m.newly, sid)
+	m.newlyMu.Unlock()
+	m.mu.Unlock()
+
+	m.log.Info().Str("sid", sid).Uint64("epoch", lease.Epoch).Msg("adopted a session")
+	return session, true, nil
+}
+
+// TakeNewlyAdopted returns the sessions adopted since it was last called, and forgets
+// them.
+//
+// The caller uses it to drain what the previous owner left pending before it reads
+// anything newer for those sessions. Commands for one session are ordered by being on
+// one stream read by one consumer, and a command abandoned mid-flight is off that stream
+// until it is reclaimed: without this it comes back after commands that arrived later,
+// which for a disconnect landing behind the connect that replaced it is the account left
+// in the state nobody asked for.
+func (m *Manager) TakeNewlyAdopted() []string {
+	m.newlyMu.Lock()
+	defer m.newlyMu.Unlock()
+	if len(m.newly) == 0 {
+		return nil
+	}
+	taken := m.newly
+	m.newly = nil
+	return m.stillRunning(taken)
+}
+
+// stillRunning drops the sessions this instance has since let go of.
+//
+// A drain claims with no minimum idle, on the grounds that this instance holds the
+// lease. Once it does not, that reasoning is gone: claiming would take the current
+// owner's commands out from under it, dispatch them as belonging to nobody, and release
+// them again on every pass.
+func (m *Manager) stillRunning(sids []string) []string {
+	if len(sids) == 0 {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	kept := sids[:0]
+	for _, sid := range sids {
+		if _, running := m.sessions[sid]; running {
+			kept = append(kept, sid)
+		}
+	}
+	if len(kept) == 0 {
+		return nil
+	}
+	return kept
+}
+
+// ReturnAdopted puts sessions back among the ones waiting to be drained, for a caller
+// that took them and could not finish. They go to the front: they were adopted before
+// anything else on the list, and until their pending commands are taken over nothing
+// newer for them can safely be read.
+func (m *Manager) ReturnAdopted(sids []string) {
+	if len(sids) == 0 {
+		return
+	}
+	sids = m.stillRunning(sids)
+	if len(sids) == 0 {
+		return
+	}
+	m.newlyMu.Lock()
+	// Deduplicated, and what is coming back still goes first: it is the older backlog.
+	// A drain that gave a command back has already put that session among the newly
+	// adopted while it ran, so appending blind leaves two copies of one sid -- and the
+	// next failed drain a third. Each copy is another pending-list query every claim
+	// makes, on the goroutine that renews the leases, for a stream already in the list.
+	m.newly = slices.DeleteFunc(m.newly, func(sid string) bool {
+		return slices.Contains(sids, sid)
+	})
+	m.newly = append(sids, m.newly...)
+	m.newlyMu.Unlock()
+}
+
+// Release stops a session and gives up its lease.
+func (m *Manager) Release(ctx context.Context, sid string) {
+	// Before the session stops rather than with the release, and that ordering is the
+	// whole of what the mark buys. Stopping is not instant -- it closes a socket and
+	// drains what the session was holding -- and throughout it the lease still names this
+	// instance while nothing here runs the account. A wake landing in that gap finds an
+	// owner, is acknowledged as an account already running, and the release that follows
+	// leaves the account owned by nobody.
+	m.givingUpAhead(ctx, sid)
+	m.stopSession(sid)
+	m.abandon(ctx, sid)
+}
+
+// stopSession takes a session out of the map and stops it, and talks to nobody.
+//
+// Separate from the hand-back that follows because their costs are not alike: this one
+// closes a socket and is local, and the hand-back is a round trip that can hang. A
+// shutdown does all of these first, so no account's socket waits on another account's
+// Redis. The mark that says the lease is on its way back is the caller's for the same
+// reason: one for the whole list rather than one per socket.
+func (m *Manager) stopSession(sid string) {
+	m.mu.Lock()
+	session, ok := m.sessions[sid]
+	delete(m.sessions, sid)
+	m.mu.Unlock()
+	if ok {
+		m.forgetAdoptedForDelete(sid, session)
+		session.Stop()
+	}
+}
+
+// abandon hands back the lease of a session this instance is no longer running.
+//
+// A release that does not reach Redis is kept and tried again on the next tick. The key
+// still names this instance until it expires, and while it does every wake for that
+// session finds the lease taken, is acknowledged, and retires: the session is then left
+// unowned with nothing scheduled to pick it up.
+func (m *Manager) abandon(ctx context.Context, sid string) {
+	// Marked before the round trip and not after it fails. A wake that lands while this
+	// is in flight finds the lease taken and this instance running nothing, and the mark
+	// is the only thing that stops it from being acknowledged as somebody else's: the
+	// release then lands, and the account is left owned by nobody with the one wake that
+	// would have started it already retired.
+	//
+	// Asked again here even where the caller has already marked it, because the callers
+	// that stop a session are not the only ones that reach this: an adoption that took a
+	// lease and could not open the session comes through with nothing marked.
+	m.givingUp(ctx, sid)
+	if _, err := m.leases.Release(ctx, sid); err != nil {
+		m.log.Warn().Err(err).Str("sid", sid).Msg("could not hand a lease back; will try again")
+		return
+	}
+	m.forgetOrphan(sid)
+}
+
+// givingUp says this instance is letting a session's lease go, in the two places a wake
+// is answered from.
+//
+// Twice, because the two readers are in different places. The local set answers for
+// wakes this instance reads, without a round trip and even when Redis is the thing that
+// is away; the key in Redis answers for the peers, which is most of them -- the wake goes
+// to every instance and any one of them may be the one to take it.
+//
+// The round trip is spent once per hand-back and not once per attempt, which is what the
+// value in the map records. A mark that did not land is not remembered as landed, so the
+// next attempt at the release pays for it again.
+func (m *Manager) givingUp(ctx context.Context, sid string) {
+	m.mark(ctx, sid, m.marking())
+}
+
+// givingUpAhead is givingUp in front of the stop that takes the socket down, where what
+// is left of the lease is the bound and not the TTL.
+func (m *Manager) givingUpAhead(ctx context.Context, sid string) {
+	m.mark(ctx, sid, m.markingAhead(sid))
+}
+
+func (m *Manager) mark(ctx context.Context, sid string, room time.Duration) {
+	m.orphanMu.Lock()
+	marked := m.orphans[sid]
+	m.orphans[sid] = marked
+	m.orphanMu.Unlock()
+	if marked {
+		return
+	}
+
+	// Bounded, and this is what lets the mark go in front of a stop at all. The stop is
+	// what takes the socket down, and a socket still open on an account whose lease a
+	// peer is free to take is the one thing the lease exists to prevent. Against the
+	// lease and not only against a constant, because the TTL is configurable and the
+	// point is a fraction of it: a mark that cannot be written in a fraction of a lease
+	// is one the account is better off without, and the worst it costs is one wake
+	// retired -- a session started late, against two live sockets on one account.
+	//
+	// Derived from the caller's context rather than detached from it, so a shutdown with
+	// less than this left still gets the socket down inside its own grace.
+	if room <= 0 {
+		// Only reachable from ahead of a stop, and there the lease has nothing left to
+		// spend: a peer may take the account from this moment, so the socket comes down
+		// instead. The hand-back behind it marks again, on the bound that has nobody
+		// waiting on it.
+		return
+	}
+	marking, done := context.WithTimeout(ctx, m.sharing(ctx, room))
+	err := m.leases.MarkHandingBack(marking, sid)
+	done()
+	if err != nil {
+		// Not fatal to the hand-back, which is the part that matters and is attempted
+		// anyway: an unmarked hand-back is the behaviour this instance had before the
+		// mark existed, and a peer's wake can still be lost to it.
+		m.log.Warn().Err(err).Str("sid", sid).
+			Msg("could not mark a hand-back for peers to see; handing back anyway")
+	}
+	m.orphanMu.Lock()
+	// Only where the session is still one this instance is giving up. A hand-back that
+	// landed while this was in flight has already forgotten it, and an adoption that won
+	// the account back has too: writing here would leave a live session carrying a mark
+	// that says it is on its way out.
+	if _, still := m.orphans[sid]; still {
+		m.orphans[sid] = err == nil
+	}
+	m.orphanMu.Unlock()
+}
+
+// marking is how long a mark may take when nothing is waiting behind it.
+func (m *Manager) marking() time.Duration {
+	return min(releaseTimeout, m.leases.TTL()/ReleaseShare)
+}
+
+// sharing cuts a mark's bound down to what leaves the release behind it a turn.
+//
+// A caller that hands the whole hand-back a budget of its own -- an adoption that could
+// not open the session gets releaseTimeout for both halves -- would otherwise see the
+// mark spend all of it against a slow Redis, and the release run on a context that is
+// already over. What that costs is the opposite of what the mark is for: a lease left
+// naming an instance running nothing, until a later tick or the TTL takes it away.
+func (m *Manager) sharing(ctx context.Context, room time.Duration) time.Duration {
+	deadline, bounded := ctx.Deadline()
+	if !bounded {
+		return room
+	}
+	return min(room, time.Until(deadline)/2)
+}
+
+// markingAhead is the same for a mark that runs in front of a stop, and zero when the
+// lease has no room for one at all.
+//
+// Against what is left of the lease and not only against its configured length. The stop
+// behind the mark is what takes the socket down, and a lease near its end has less than a
+// share of a TTL to give: a bound written from the TTL alone would run past the moment a
+// peer may take the account, with this instance still talking to WhatsApp on it. Zero is
+// the honest answer for a lease that has nothing left, and the caller stops the socket
+// instead of shortening the mark into a round trip that cannot land.
+//
+// Only ahead of a stop. A mark that runs after the socket is already down has nobody
+// waiting on it and is the only thing standing between a peer's wake and an account left
+// unowned, so it is bounded by the constant and never skipped: local freshness reaching
+// zero says this instance may not act on the lease, not that Redis has stopped naming it
+// -- a renewal whose answer was lost leaves exactly that, and Release forgets the lease
+// locally before its first attempt, so every retry would find zero.
+func (m *Manager) markingAhead(sid string) time.Duration {
+	return min(m.marking(), m.leases.Freshness(sid))
+}
+
+// releaseOrphans retries the hand-backs that did not reach Redis.
+//
+// A session adopted again in the meantime is dropped from the list rather than
+// released: the lease it holds now is a live one, and the release compares the instance
+// and nothing else, so it would delete the lease of a session this instance is running.
+func (m *Manager) releaseOrphans(ctx context.Context) {
+	m.orphanMu.Lock()
+	if len(m.orphans) == 0 {
+		m.orphanMu.Unlock()
+		return
+	}
+	sids := make([]string, 0, len(m.orphans))
+	for sid := range m.orphans {
+		sids = append(sids, sid)
+	}
+	m.orphanMu.Unlock()
+
+	sort.Strings(sids)
+	for _, sid := range sids {
+		if ctx.Err() != nil {
+			// Out of the window. What was not reached is still in the map, so the next
+			// tick starts where this one stopped.
+			return
+		}
+		if !m.tryHoldHanding(sid) {
+			// An adoption or a hand-back of this account is under way, and the mark is
+			// what a hand-back sets before its round trip: retrying alongside it is a
+			// second release, which lands after the first one and after whatever lease
+			// was won in between and deletes that one. Tried again on the next tick.
+			continue
+		}
+		m.mu.RLock()
+		_, running := m.sessions[sid]
+		m.mu.RUnlock()
+		if running {
+			m.forgetOrphan(sid)
+			m.dropHanding(sid)
+			continue
+		}
+		m.abandon(ctx, sid)
+		m.dropHanding(sid)
+	}
+}
+
+// handingBack reports whether a lease this instance failed to give up is still queued to
+// be tried again.
+func (m *Manager) handingBack(sid string) bool {
+	m.orphanMu.Lock()
+	defer m.orphanMu.Unlock()
+	_, queued := m.orphans[sid]
+	return queued
+}
+
+// HandingBack reports whether this instance still has the lease of an account it stopped
+// queued to be given back. An adoption of that account is refused until the hand-back has
+// run, so a caller about to spend something on one -- the resume sweep's fleet-wide turn --
+// asks first.
+func (m *Manager) HandingBack(sid string) bool { return m.handingBack(sid) }
+
+// unreturned counts how many of these sessions still have a lease this instance could not
+// hand back.
+func (m *Manager) unreturned(sids []string) int {
+	m.orphanMu.Lock()
+	defer m.orphanMu.Unlock()
+	n := 0
+	for _, sid := range sids {
+		if _, queued := m.orphans[sid]; queued {
+			n++
+		}
+	}
+	return n
+}
+
+// owedHandBacks is every lease a shutdown is about to give back: the sessions running, and
+// the ones stopped earlier whose hand-back did not reach Redis and is still queued.
+func (m *Manager) owedHandBacks() []string {
+	owed := m.SIDs()
+	m.orphanMu.Lock()
+	for sid := range m.orphans {
+		if !slices.Contains(owed, sid) {
+			owed = append(owed, sid)
+		}
+	}
+	m.orphanMu.Unlock()
+	return owed
+}
+
+func (m *Manager) forgetOrphan(sid string) {
+	m.orphanMu.Lock()
+	delete(m.orphans, sid)
+	m.orphanMu.Unlock()
+}
+
+// GiveBack hands a delivery back without carrying it out, and remembers that the session
+// it belongs to has an older entry pending again.
+//
+// What decides whether a site comes through here is not whether it knows which session
+// the command belongs to -- that question is easy and it misleads. The queue behind `own`
+// knows the sid of all three kinds it drains and only one of them may be marked. What
+// decides is whether this instance goes on reading that session's stream by `>`: if it
+// does, an older entry left pending there would be overtaken, and the mark is what stops
+// it. A site where the answer is no releases directly and says so: an offer refused by a
+// session being stopped is this instance letting the account go, and a wake rides the
+// control stream, where there is no per-session turn to keep.
+//
+// What decides here is the delivery itself: a wake and a ping live on the control stream,
+// so giving one back leaves nothing pending on a session's, and a command for a session
+// this instance does not run is on its way to whoever does.
+//
+// The set is the one adoption uses, and reusing it is not a shortcut. Both mean the same
+// thing -- there is an older command on this stream that has not been carried out -- and
+// the drain already lets a session back into the `>` read only when a pass finds nothing
+// left for it. A mark cleared on the first command accepted instead would let a second
+// held one be overtaken by something newer.
+func (m *Manager) GiveBack(delivery *transport.Delivery) {
+	release(delivery)
+
+	sid := delivery.Command.SID
+	switch {
+	case sid == "":
+	case delivery.Command.Type == protocol.CommandSessionWake,
+		delivery.Command.Type == protocol.CommandAdminPing:
+	default:
+		m.mu.RLock()
+		_, running := m.sessions[sid]
+		m.mu.RUnlock()
+		if running {
+			m.undrained(sid)
+		}
+	}
+}
+
+// undrained puts a session back among those whose stream has to be taken over before
+// anything newer is read for it.
+func (m *Manager) undrained(sid string) {
+	m.newlyMu.Lock()
+	if !slices.Contains(m.newly, sid) {
+		m.newly = append(m.newly, sid)
+	}
+	m.newlyMu.Unlock()
+}
+
+// Dispatch routes one command. It answers by itself for the two it can answer without
+// a session (`session.wake` and `admin.ping`) and hands the rest to the session.
+//
+// It takes no context and does no I/O, which is the whole of its contract to the caller:
+// the goroutine that dispatches is the one that renews every lease this instance holds,
+// and nothing routed here may hold it up. A session's command is offered to that
+// session's queue, and the three this manager owns are queued on its own goroutine.
+//
+// It reports whether the command was left pending for somebody to run later, which is
+// what a caller holding the rest of a batch needs: nothing newer for that session may be
+// dispatched behind one that stayed pending.
+func (m *Manager) Dispatch(delivery *transport.Delivery) (pending bool) {
+	command := delivery.Command
+	switch command.Type {
+	case protocol.CommandSessionWake:
+		return m.own(delivery, m.wake)
+	case protocol.CommandAdminPing:
+		began := m.now()
+		return m.own(delivery, func(ctx context.Context, ping *transport.Delivery) {
+			m.reportCommand(&ping.Command, began, m.pong(ctx, ping))
+		})
+	}
+
+	m.mu.RLock()
+	session, running := m.sessions[command.SID]
+	m.mu.RUnlock()
+
+	if !running {
+		if command.Type == protocol.CommandSessionDelete && command.SID != "" {
+			// The one command worth adopting an account for, and the one state it is
+			// most often sent in: an inbox destroyed while its session was down, or
+			// while the fleet was restarting. Left for an owner that does not exist, a
+			// teardown waits for a session nobody is going to start -- the account goes
+			// on being adopted later, reconnecting and publishing for an inbox that is
+			// gone.
+			return m.own(delivery, m.takeForDelete)
+		}
+		// Not ours. Leaving it un-acknowledged is the point: the instance that does own
+		// the session reads the same stream, and an instance that owns nothing must not
+		// swallow a command on its way there. Released, so it does not read as work this
+		// process is still doing and become unclaimable.
+		//
+		// Released rather than given back, and the distinction is the whole of it: the
+		// mark says "this instance left something pending on a stream it reads", and this
+		// instance does not read this one.
+		release(delivery)
+		return true
+	}
+	switch session.Offer(delivery) {
+	case OfferAccepted:
+	case OfferBusy:
+		if !m.stillHeard(&command, delivery.Redelivered) {
+			// Backpressure is an answer, and an answer only ends a command while somebody
+			// is listening for it. Refusing into nowhere is not backpressure: it retires
+			// the only copy of a command nobody ran, with no reply and no `command.failed`
+			// to say so.
+			//
+			// Left pending instead, with its age, so the queue that is full now can take
+			// it when it drains. Given back rather than released, unlike the stopping
+			// session below: this instance still runs this one and goes on reading its
+			// stream, so without the mark the first command the queue accepts after it
+			// drains would overtake the one held here.
+			m.GiveBack(delivery)
+			return true
+		}
+		began := m.now()
+		return m.own(delivery, func(ctx context.Context, busy *transport.Delivery) {
+			refusal := protocol.NewError(protocol.ErrorRateLimited, "the session has too many commands waiting")
+			m.refuse(ctx, busy, refusal)
+			m.reportCommand(&busy.Command, began, refusal)
+		})
+	case OfferStopped:
+		// This instance is letting the account go. Refusing would answer for an owner
+		// it is no longer, so the command stays pending for whoever takes it next.
+		//
+		// Released rather than given back, and here it matters rather than merely reads
+		// better: marking would schedule a drain for an account this instance is giving
+		// up, and the drain claims the stream with no minimum idle time -- taking entries
+		// the new owner already holds and handing them back at age zero, below the idle
+		// floor its own reclaim watches. It stays pending for the owner instead.
+		release(delivery)
+		return true
+	}
+	return false
+}
+
+// own queues a command for the goroutine that carries out what this manager answers
+// itself, and never blocks doing it. It reports whether the command was left pending.
+//
+// A queue with no room leaves the delivery pending rather than refusing it: released,
+// age kept, so a later pass brings it back -- to this instance once it has caught up, or
+// to a peer. That is the right trade for all three. A wake left pending is a session
+// started a claim delay later; refused, it would be a session nobody starts at all. A
+// ping left pending is answered on the redelivery; refused, its caller is told this
+// instance is busy, which is true but is not what it asked. And the queue-full refusal
+// is itself the answer to a session that is behind -- dropping it on a manager that is
+// also behind would retire, unrun, a command the client never heard about.
+func (m *Manager) own(delivery *transport.Delivery, give func(context.Context, *transport.Delivery)) bool {
+	select {
+	case m.answers <- answer{delivery: delivery, give: give}:
+		return false
+	default:
+		m.log.Warn().Str("cmd_id", delivery.Command.ID).Str("type", string(delivery.Command.Type)).
+			Msg("no room to carry out a command this instance answers itself; leaving it pending")
+		// Given back rather than released, and this is the site that needs it: a wake and
+		// a ping ride the control stream and carry no session's turn, but a refusal that
+		// found no room is a command for a session this instance runs and goes on reading
+		// by `>`. Released, the next command its queue accepts would overtake it.
+		m.GiveBack(delivery)
+		return true
+	}
+}
+
+// Answer carries out the commands this manager owns, on a goroutine of its own. The
+// returned channel closes once it has stopped.
+//
+// The context is the instance's lifetime, which is what gives the work back the bounds
+// it is written against: an adoption gets AdoptTimeout rather than whatever was left of
+// a tick window, and an acknowledgement gets its own two seconds without spending a
+// renewal's. Neither bound moved; what moved is the goroutine they are measured on.
+func (m *Manager) Answer(ctx context.Context) <-chan struct{} {
+	stopped := make(chan struct{})
+	// The work outlives the cancellation that stops the loop taking more on. Every step
+	// it runs is bounded on its own -- AdoptTimeout for an adoption, ackTimeout for a
+	// reply or a retirement -- so a command already being carried out when the instance
+	// begins to stop is finished rather than torn in half, and whoever waits on the
+	// channel below waits for exactly that. Under the caller's context instead, a
+	// shutdown would cut an adoption between the store and the lease.
+	carrying := context.WithoutCancel(ctx)
+	go func() {
+		defer close(stopped)
+		for {
+			// Asked before the select rather than inside it. A select with both arms
+			// ready picks between them at random, so a command queued behind one being
+			// carried out was sometimes carried out too and sometimes given back --
+			// which is a session adopted onto an instance that is going away, on a coin
+			// toss. Once the instance is stopping, nothing more is started.
+			if ctx.Err() != nil {
+				m.releaseQueued()
+				return
+			}
+			select {
+			case <-ctx.Done():
+				// Given back rather than dropped. These are commands nobody has carried
+				// out, and a delivery this process forgets about while still holding it
+				// is one no reclaim can take: the instance is going away, so the sooner
+				// they read as untouched the sooner a peer runs them.
+				m.releaseQueued()
+				return
+			case work := <-m.answers:
+				// Asked again here, and not only above: a cancellation landing while this
+				// was blocked on the receive leaves both arms ready, and the random pick
+				// is the same coin toss as before -- a command dequeued after the
+				// instance began to stop, adopting a session onto one that is going away.
+				if ctx.Err() != nil {
+					m.GiveBack(work.delivery)
+					m.releaseQueued()
+					return
+				}
+				work.give(carrying, work.delivery)
+			}
+		}
+	}()
+	return stopped
+}
+
+// releaseQueued hands back everything still waiting, without carrying any of it out.
+func (m *Manager) releaseQueued() {
+	for {
+		select {
+		case work := <-m.answers:
+			m.GiveBack(work.delivery)
+		default:
+			return
+		}
+	}
+}
+
+// wake asks this instance to pick a session up. Every instance reads the control
+// stream, so the first one to win the lease runs it and the others find it taken,
+// which is the fleet's whole scheduling algorithm.
+func (m *Manager) wake(ctx context.Context, delivery *transport.Delivery) {
+	sid := delivery.Command.SID
+	if sid == "" {
+		m.ack(ctx, delivery)
+		return
+	}
+
+	// The quarantine gates what the connector does on its own and nothing else: what a
+	// client asks for is carried out, quarantine or not, which PROTOCOL.md promises in as
+	// many words and which the test below this one fences. A wake the fleet has
+	// already handed out is not a client asking, though. It is this fleet repeating an
+	// attempt it has already made, and pacing that is what the backoff is for.
+	//
+	// On DeliveredBefore and not on Redelivered, which is the narrower question and the
+	// wrong one here: a wake the fleet cannot act on is handed back unrun and read out of
+	// the history again on the very next block, so its idle never grows and Redelivered
+	// is false on every one of those repeats -- measured on 2771941, twenty times in
+	// forty-five seconds. Gating on it would leave the loop untouched.
+	//
+	// What it separates is first delivery from redelivery, which is not quite the same as
+	// separating a client's ask from the fleet repeating itself, and the gap is worth
+	// naming. A wake read by an instance that died before it adopted comes back as a
+	// redelivery carrying an ask nobody ever served, and if the account is waiting out a
+	// backoff this declines it. The cost is bounded and the way out is written into the
+	// contract: the client publishes another wake, which is read fresh and adopts. It is
+	// also a narrow case -- an account is only waiting out a backoff because an earlier
+	// adoption already failed, so the ask this delays is one that was likely to fail too.
+	if delivery.DeliveredBefore {
+		if until, waiting := m.waitingOut(ctx, sid); waiting {
+			m.log.Info().Str("sid", sid).Time("until", until).
+				Msg("a wake came round again for an account the fleet is leaving alone; not trying it yet")
+			// Forfeited rather than released, for the reason the failed adoption below
+			// forfeits: kept at the head of the pending list it would be taken first
+			// again on the next pass, and the wakes behind it -- sessions nobody is
+			// running either -- would never get a turn. Never acknowledged: a wake is the
+			// only thing that starts a session with no `desired` row for the resume sweep
+			// to find, so retiring it is how an account ends up paired, unowned and
+			// silent.
+			forfeit(delivery)
+			return
+		}
+	}
+
+	// Read before the account is adopted, so a store that does not answer costs the wake
+	// a turn and nothing else: adopted first, the redelivery would find the session
+	// already running here, and the sweep that could have brought it up asks only about
+	// accounts nobody runs.
+	wants, bringUp, err := m.wakeWants(ctx, delivery)
+	if err != nil {
+		m.log.Error().Err(err).Str("sid", sid).
+			Msg("could not read whether a woken session should be connected; leaving the wake pending")
+		// Forfeited, for the reason the failed adoption below forfeits.
+		forfeit(delivery)
+		return
+	}
+
+	session, err := m.Adopt(ctx, sid)
+	switch {
+	case err == nil:
+		if bringUp && !m.bringUp(session, wants) {
+			// Left pending rather than acknowledged: acknowledged, the client's ask is
+			// retired with nothing queued to carry it out, and the sweep does not look at an
+			// account this instance runs. Forfeited, for the reason a failed adoption is.
+			forfeit(delivery)
+			return
+		}
+	case errors.Is(err, errLeaving):
+		// Not this instance's turn to answer: it is giving the account up, and the wake is
+		// what starts it again once nobody owns it. Released rather than forfeited, so it
+		// keeps its age -- the account has been unowned since it was sent.
+		release(delivery)
+		return
+	case errors.Is(err, cluster.ErrNotOwner):
+		if errors.Is(err, cluster.ErrHandingBack) || m.handingBack(sid) {
+			// Owned by an instance that is running nothing and is still trying to give
+			// the lease up, whether that is this one or a peer. Acknowledging here on the
+			// grounds that somebody has it retires the only thing that would have started
+			// the session, and once the stale key expires there is nothing left to start
+			// it at all.
+			m.log.Warn().Str("sid", sid).
+				Msg("a wake found a lease that is still being handed back; leaving it pending")
+			// A wake rides the control stream, not a session's, so there is no per-session
+			// turn to keep and nothing to mark.
+			release(delivery)
+			return
+		}
+		if !m.oweWake(ctx, delivery) {
+			return
+		}
+	default:
+		// Left unacknowledged on purpose. Every instance reads this stream through one
+		// consumer group, so acknowledging a wake nobody could act on retires it: the
+		// session then stays unowned until a client happens to send another. Whatever
+		// stopped the adoption — a database that was away, a store that could not be
+		// read — may well be over by the time this is reclaimed.
+		m.log.Error().Err(err).Str("sid", sid).Msg("failed to adopt a woken session; leaving the wake pending")
+		// Forfeited rather than released: this instance took its turn at it. Keeping the
+		// age would put it back at the head of the pending list, where this instance
+		// takes it first again on the next pass, and again — and the wakes behind it,
+		// which are the sessions nobody is running either, would never get a turn.
+		forfeit(delivery)
+		return
+	}
+	m.ack(ctx, delivery)
+}
+
+// oweWake leaves a wake for the instance that owns its account, and reports whether the
+// wake may now be acknowledged (#259).
+//
+// Acknowledged, because the account has an owner. But the owner may have decided a moment
+// ago to give the account back and not have written its mark yet, and acknowledged into
+// that gap the wake is the one thing that would have started the account again once it is
+// unowned. So it is left owed to the owner, and the owner's release puts it back on the
+// control stream in the same step (cluster.Leases.OweWake). An owner that keeps the
+// account never releases, and the entry expires having done nothing: a peer still does not
+// hold wakes pending for an account somebody runs, which is the loop #241 was.
+//
+// Put back under an id of its own, since the original is acknowledged here, with the same
+// account and the same payload.
+func (m *Manager) oweWake(ctx context.Context, delivery *transport.Delivery) bool {
+	sid := delivery.Command.SID
+	again := delivery.Command
+	again.ID = m.newID()
+	again.TS = time.Now().UnixMilli()
+	fields, err := again.Fields()
+	if err != nil {
+		m.log.Error().Err(err).Str("sid", sid).Msg("could not render a wake to leave for the account's owner; leaving it pending")
+		forfeit(delivery)
+		return false
+	}
+	// On a deadline of its own, like the ack that follows: the caller's context has no
+	// deadline, and a Redis that stopped answering would hold every wake and ping behind
+	// this one, and a shutdown waiting for it.
+	owing, cancel := context.WithTimeout(ctx, ackTimeout)
+	defer cancel()
+	owed, err := m.leases.OweWake(owing, sid, fields)
+	switch {
+	case err != nil:
+		m.log.Error().Err(err).Str("sid", sid).Msg("could not leave a wake for the account's owner; leaving it pending")
+		forfeit(delivery)
+		return false
+	case owed == cluster.OwedHandingBack:
+		m.log.Warn().Str("sid", sid).Msg("a wake found a lease that is still being handed back; leaving it pending")
+		release(delivery)
+		return false
+	case owed == cluster.OwedNobodyHolds:
+		// Let go between the adoption that failed and here: the account is free, and the
+		// wake is what starts it. Kept at its age, so it is taken first on the next pass.
+		release(delivery)
+		return false
+	}
+	return true
+}
+
+// wakeWants reads whether a `session.wake` puts its account in the air, and with what.
+//
+// It does when the wake asks for the account to be connected and the account is one the
+// resume sweep would bring back: its client asked for it to be connected, and it has a
+// device to connect with. The wake carries no connect of its own, so what licenses the
+// dial is the record the client's own connect left, and what the account comes back with
+// is what that record remembers. Anything short of that and the wake adopts and stops
+// there, which is all a wake for an account nobody has paired, or one its client turned
+// off, can do.
+//
+// A payload that does not decode asks for nothing: the frame names no state, and a dial
+// is not the default for a request that did not say so.
+func (m *Manager) wakeWants(ctx context.Context, delivery *transport.Delivery) (store.Wants, bool, error) {
+	if m.store == nil {
+		return store.Wants{}, false, nil
+	}
+	var asked struct {
+		Desired string `json:"desired"`
+	}
+	if err := json.Unmarshal(delivery.Command.Payload, &asked); err != nil || asked.Desired != store.DesiredConnected {
+		return store.Wants{}, false, nil
+	}
+	read, cancel := context.WithTimeout(ctx, AdoptTimeout)
+	defer cancel()
+	return m.store.WantedSession(read, delivery.Command.SID)
+}
+
+// bringUp hands a woken session the connect that puts it in the air.
+//
+// Whether this wake opened the session or found it running here: a resume on a socket that
+// is up, or on its way up, is no change at all in either engine, and one on a session whose
+// last dial failed dials again. What it carries is only a first guess: the session reads
+// the record again when it runs the connect, because a command queued ahead of it -- a
+// disconnect, a connect naming another proxy -- may have changed it by then.
+//
+// It reports whether the connect was queued.
+func (m *Manager) bringUp(session *Session, wants store.Wants) bool {
+	delivery, built := m.resumeConnect(session.SID(), wants)
+	if !built {
+		return false
+	}
+	if session.Offer(delivery) != OfferAccepted {
+		m.log.Info().Str("sid", session.SID()).
+			Msg("a woken session had no room for the connect that would put it in the air; leaving the wake pending")
+		return false
+	}
+	return true
+}
+
+// adoptedForDelete is one account opened to serve teardowns and nothing else.
+type adoptedForDelete struct {
+	session *Session
+	// refused says a teardown on this session was answered `expired`, so what the
+	// adoption was for is not going to happen. Marked here rather than acted on, because
+	// the answer comes from the session's own executor and stopping a session from inside
+	// the command it is answering waits on the goroutine doing the asking.
+	refused bool
+	// carried is what the session had answered when that refusal went out, and the
+	// hand-back is licensed by the count still standing there.
+	//
+	// Written by the refusal and not by the adoption, and the difference is a case the
+	// fleet actually produces: the same late teardown is delivered again while the
+	// hand-back is still waiting for a tick, `Dispatch` finds the session and hands it
+	// straight to the executor, and a count taken once at the adoption would read those
+	// repeats as "something else came to want this account". Re-armed by each refusal,
+	// the licence says what it means -- nothing but refused teardowns has run here.
+	carried int64
+}
+
+// afterCommand keeps the list of accounts adopted for a teardown in step with what the
+// account's own executor has just finished doing, and it is deliberately not "undo
+// whenever a teardown was refused".
+//
+// `expired` is the one refusal that means the command never began and never will: the
+// deadline is read at the top of `carryOut`, by the same clock in the same process that
+// adopted a moment earlier, so the account was opened to serve a command whose answer was
+// already decided. There is nothing to show for it and nobody asked for the account.
+//
+// The other two refusals are different and are measured, not assumed:
+//
+//   - `owned_elsewhere` does not mean the account moved. It means this holder's own
+//     renewal is older than `ttl - margin`, which the next heartbeat repairs: measured on
+//     the base, `Owned` is false at the refusal and true one `RenewAll` later, with the
+//     lease key naming this instance throughout. Giving the account back there would drop
+//     a session this instance still runs and still renews.
+//   - a teardown the engine refused is an attempt, not a refusal before the fact. The
+//     client is told it failed and sends it again, and the account being adopted already
+//     is what makes the second attempt free: measured, a redelivery finds the session in
+//     the map and `Dispatch` hands it to the executor without a second adoption and
+//     without a second epoch. Undoing would charge the retry for both.
+//
+// Anything else that can end a teardown -- a ledger that would not answer, a lifecycle
+// error -- is an attempt too, and falls under the same rule as the engine's refusal.
+//
+// A command that is not a teardown ends the undoing, because it means somebody is using
+// the account -- unless it was refused before it ran, which says nothing about the account
+// and must not pin one nobody asked for to this instance.
+//
+// Two routes make an account wanted, and the list is deliberate rather than lucky: a
+// command carried out on it, which is this function, and an adoption that finds the
+// session already there, which is `adopt` and covers `session.wake` and the resume sweep.
+// Everything else that could reach a session is closed by one of the two or by a clause of
+// `claimIdle`, and it is worth naming which, because "it is covered" without saying how is
+// how three of the holes in this design got here:
+//
+//   - An inbound event from the engine needs a socket, and an account opened for a teardown
+//     never dials: `Open` prepares a client and `Session.Connect` is what dials, which only
+//     runs as a command and so is the first route.
+//   - A command refused `rate_limited` by a full queue is answered on the manager's own
+//     goroutine and never reaches here, so it moves nothing -- and the queue it found full
+//     is what `claimIdle` turns the hand-back away on, until it drains and those commands
+//     run, which is the first route again.
+//   - A command refused because the session is stopping is turned away by `claimIdle` on
+//     `stopping` or `shutFor`.
+//   - A drain scheduled by `undrained` claims the session's stream back, and whatever it
+//     finds is dispatched, which is the first route.
+//   - `Release` and `StopAll` take the session out of the map, which the sweep notices by
+//     pointer. That is the account ending rather than being wanted.
+//
+// A route added later needs its own way out of this list, or it arrives as an account
+// handed away from under whoever asked for it.
+// The session is named as well as the account, and that is not belt and braces. A lease
+// that expires has its session taken out of the map before `Stop` has returned, without the
+// adoption gate held, so the answer goroutine can put a replacement in place while the old
+// executor is still finishing its last command. Matched on the account alone, that stale
+// report would erase the replacement's registration, and the teardown the replacement was
+// adopted for would then leave the account owned for good.
+func (m *Manager) afterCommand(sid string, from *Session, code protocol.ErrorCode, teardown, happened bool) {
+	switch {
+	case teardown && !happened && code != protocol.ErrorOwnedElsewhere:
+		// The teardown did not run. It was refused for arriving late, or answered out of
+		// the idempotency record for a command that ran a day ago -- and a record is not a
+		// fact about now: an account torn down and deleted has no session, so a redelivery
+		// of that teardown adopts it afresh, takes a lease and a new epoch, is answered
+		// `ok` from the record, and tears nothing down. Nobody wants that account; nobody
+		// can, it no longer exists.
+		//
+		// `owned_elsewhere` is the exception and it is measured, not assumed: it does not
+		// mean the account moved, it means this holder's own renewal is older than
+		// `ttl - margin`, which the next heartbeat repairs, with the lease key naming this
+		// instance throughout. Giving the account back there would drop a session this
+		// instance still runs and still renews.
+		m.forDeleteMu.Lock()
+		if entry, listed := m.forDelete[sid]; listed && entry.session == from {
+			entry.refused = true
+			entry.carried = entry.session.carriedSoFar()
+			m.forDelete[sid] = entry
+			m.log.Info().Str("sid", sid).Str("code", string(code)).
+				Msg("a teardown ran nothing; giving back the account it was adopted for")
+		}
+		m.forDeleteMu.Unlock()
+	case !teardown && !carriedOut(code):
+		// Refused before it ran, so nothing happened to this account and the hand-back
+		// still stands. A late `session.connect` is not a client using the account, and
+		// treating it as one would pin an account nobody ever asked for to this instance
+		// for the life of the process.
+	default:
+		// Either the account was used, or a teardown was attempted on it and the account
+		// is staying: both end the undoing.
+		m.forgetAdoptedForDelete(sid, from)
+	}
+}
+
+// carriedOut is `ran` on the answer side: the two codes `carryOut` produces before any work
+// begins, and everything else.
+func carriedOut(code protocol.ErrorCode) bool {
+	switch code {
+	case protocol.ErrorExpired, protocol.ErrorOwnedElsewhere:
+		return false
+	default:
+		return true
+	}
+}
+
+// adoptedToDelete records that this instance opened an account in order to serve one
+// teardown. `adopt` does it under the lock that publishes the session; this is how a test
+// builds the same state on a session it adopted for itself.
+func (m *Manager) adoptedToDelete(sid string, session *Session) {
+	m.forDeleteMu.Lock()
+	m.forDelete[sid] = adoptedForDelete{session: session}
+	m.forDeleteMu.Unlock()
+}
+
+// giveBackRefusedTeardowns hands back the accounts opened for a teardown that was refused
+// before it ran, and is called from the heartbeat for the reason the mark exists. It is
+// also the only thing that walks the list, so it is where a registration whose session is
+// already gone is dropped.
+//
+// What it does not cover is #259, and the shape of that is worth having here. The mark that
+// makes a peer leave a `session.wake` pending is written when the release happens, in
+// `abandon` and in `givingUpAll`, and not when this instance decides to let the account go:
+// in between it is an ordinary owner carrying no mark, the peer's `Acquire` is answered
+// `not_owner`, and the one ask that would have started that account is acknowledged and
+// retired. Measured on the base at the hand-back it already has -- a retired session, the
+// wake acknowledged by the peer, the account released on the next tick -- so this is the
+// window every hand-back here has, and the refusal below is one more place that has it.
+//
+// What this one adds over the base is the line after: the account is then nobody's, and a
+// `session.connect` for an account nobody runs is left pending, where the instance that
+// was still holding it served it. It was holding an account it should not have been, which
+// is what this file is fixing. Closing the window itself means writing the mark when the
+// decision is taken rather than when the release happens, which turns "I am letting this go
+// now" into "I mean to", and a mark that means the second one needs an undoing for every
+// way a hand-back is called off -- none of which exists in `internal/cluster`, where a
+// release and a winning acquire are the only two things that clear it.
+//
+// An account is given back only while it is still the session that was adopted and still
+// has answered nothing but that teardown. Both clauses guard the same thing from two
+// sides: the account may have been handed back and taken again under this instance, in
+// which case the pointer differs, or something may have arrived that wants it up, in
+// which case the count moved. `claimIdle` asks a third time, with the door shut in the
+// same step, about a command that arrived between this pass and the stop.
+//
+// The walk is over every registration and not only the ones waiting to go back, because a
+// session can be taken out from under one before its teardown is ever answered. A lease
+// lost between the adoption and the executor reaching the command is the route that
+// happens: the tick drops the session and stops it, and stopping releases what is still
+// queued instead of running it, so `afterCommand` never reports and the registration is
+// never armed. Filtering on the mark first would leave that entry unreachable for the
+// life of the process, holding the session and the whatsmeow client behind it, and the
+// pointer comparison the hand-back already makes is the same question that answers it.
+func (m *Manager) giveBackRefusedTeardowns(ctx context.Context) {
+	m.forDeleteMu.Lock()
+	listed := make(map[string]adoptedForDelete, len(m.forDelete))
+	for sid, entry := range m.forDelete {
+		listed[sid] = entry
+	}
+	m.forDeleteMu.Unlock()
+	if len(listed) == 0 {
+		return
+	}
+
+	// Read after the copy above, and that order is the whole of what it buys. An adoption
+	// registers itself only once its session is in the map, so a session missing from a
+	// list taken *after* the copy really is one this instance has let go. Taken before,
+	// the list would be missing the accounts adopted in between, and the entries they had
+	// just written would be dropped as though they had already disappeared -- leaving
+	// exactly the accounts this function exists to give back owned forever.
+	running := m.running()
+
+	// Gone, or replaced by an adoption of its own: there is nothing of ours left to undo,
+	// and whatever is there now has its own reason to be. Done for the whole list before
+	// anything is handed back, so that running out of tick halfway through the hand-backs
+	// does not leave some of them listed against a session nobody has.
+	for sid, entry := range listed {
+		if running[sid] != entry.session {
+			m.forgetAdoptedForDelete(sid, entry.session)
+			delete(listed, sid)
+		}
+	}
+
+	for sid, entry := range listed {
+		if !entry.refused {
+			// Adopted, and how its teardown ends is not known yet. The account is this
+			// instance's for as long as that takes, and the report is what arms it.
+			continue
+		}
+		if ctx.Err() != nil {
+			// Out of tick, and the registration stays: the account is idle and nothing is
+			// waiting on it, so the next pass finds it the same way. What it costs is one
+			// more tick of a lease nobody else can take.
+			return
+		}
+		if !m.releaseIdle(ctx, sid, entry) {
+			// Refused, and refused for a reason that may be gone next tick: an adoption in
+			// the way, a wake that took the account while this pass was walking, a command
+			// that had not finished when it began. Kept registered, because nothing else
+			// would ever find this session again -- it is not retired, so no sweep lists
+			// it, and its lease is renewed for as long as this instance lives.
+			continue
+		}
+		m.forgetAdoptedForDelete(sid, entry.session)
+	}
+}
+
+// forgetAdoptedForDelete drops a registration, and only while it is still the one the
+// caller was working from: a hand-back that took a tick can finish after the account was
+// adopted again, and the entry by then belongs to that newer adoption.
+func (m *Manager) forgetAdoptedForDelete(sid string, was *Session) {
+	m.forDeleteMu.Lock()
+	if entry, ok := m.forDelete[sid]; ok && (was == nil || entry.session == was) {
+		delete(m.forDelete, sid)
+	}
+	m.forDeleteMu.Unlock()
+}
+
+// takeForDelete adopts an account nobody is running so that its own executor can tear it
+// down, and hands the command to it.
+//
+// This is the only thing the manager does for a teardown, and it is what `wake` already
+// does for a different reason: a command is carried out by the session it names, and an
+// account nobody has adopted has no session to carry anything out. Adoption gives it
+// one, under the lease that fences every store write and with the engine open on the
+// credentials the unlink has to be signed with. The teardown is an ordinary command from
+// there -- same queue, same order, same deadline, same record of having run.
+//
+// An account this instance adopts here never connects. The socket the unlink would have
+// gone out over is one a session that was down does not have, and dialling for it would
+// be a connection made for an inbox that no longer exists; what that costs is a device
+// left listed on the operator's phone, which the engine names in its log.
+//
+// And an adoption made here is undone when the teardown does not run. The account was
+// opened to serve one command; a teardown refused for arriving late is one the executor
+// decided against before it began, so what the adoption was for is gone and nothing else
+// asked for the account. Left alone it would sit in `wac_sessions_running` under a lease
+// this instance renews forever, which no sweep collects: `SweepRetired` looks for a
+// session the engine finished with, and this one is merely idle. `teardownRefused` above
+// says which refusals count and which do not, and why.
+func (m *Manager) takeForDelete(ctx context.Context, delivery *transport.Delivery) {
+	sid := delivery.Command.SID
+	session, _, err := m.adopt(ctx, sid, toTearDown)
+	switch {
+	case err == nil:
+	case errors.Is(err, errLeaving):
+		// This instance is in the middle of giving the account up. Released, so it keeps
+		// the age it has had since it was sent: the account is about to belong to nobody,
+		// and the next pass finds it that way.
+		release(delivery)
+		return
+	case errors.Is(err, cluster.ErrNotOwner):
+		// A peer is running it, and nothing here can make it stop: no command in the
+		// protocol asks an owner to give a session up on demand, and `wa:handback:<sid>`
+		// is an owner deciding to give one up itself, not a way for a peer to ask, so
+		// there is nothing this instance could write. Tearing down from here would
+		// pull the credentials out from under a live socket that still holds the lease.
+		//
+		// Left pending for the owner, which reads the control stream too, and forfeited
+		// rather than released: an entry that keeps its age is the oldest one on every
+		// pass, so this instance would claim it first again, and again, while the owner
+		// never got a turn. Measured at 126 claims in two minutes on a fleet of two.
+		m.log.Info().Str("sid", sid).
+			Msg("a delete named a session another instance is running; leaving it pending for the owner")
+		forfeit(delivery)
+		return
+	default:
+		// Whatever stopped the adoption -- a database that was away, a store that could
+		// not be read -- may well be over by the time this is reclaimed. Forfeited for the
+		// same reason a wake is: this instance took its turn at it.
+		m.log.Error().Err(err).Str("sid", sid).Msg("failed to adopt a session to tear it down; leaving the delete pending")
+		forfeit(delivery)
+		return
+	}
+
+	switch session.Offer(delivery) {
+	case OfferAccepted:
+	case OfferStopped:
+		// The session is on its way out, so this instance is about to stop being the
+		// owner: the teardown stays pending for whoever takes the account next. Released
+		// rather than given back, because marking would schedule a drain of a stream this
+		// instance is giving up and take it from under the owner taking it over.
+		release(delivery)
+	default:
+		// The queue is full, which for a session adopted a moment ago means a client that
+		// had already filled it. Given back rather than released, so that nothing newer
+		// for this account overtakes the teardown: a delete published to `wa:cmd:<sid>`
+		// is on a stream this instance reads, and the mark is what keeps the next command
+		// it accepts from being read ahead of this one. It costs a drain of that stream
+		// for a delete that arrived on the control stream, which is a pass over entries
+		// this instance owns either way.
+		m.GiveBack(delivery)
+	}
+}
+
+// Resume asks this instance to take a session that should be running and put it back in
+// the air, with the subscription its client asked for. It reports whether the request was
+// queued, and does no I/O of its own: the caller is a sweep, and the goroutine that
+// carries this out is the one that answers every wake.
+//
+// This is the connector starting a session nobody asked it to start in this moment, and
+// the licence for it is the record the client wrote when it asked for the connection.
+// Without it the account is paired, unowned and silent: a lease dies with the instance
+// that held it, a `session.wake` is a frame read once, and neither is a record of intent.
+// Measured in production as an inbox showing `open` and delivering nothing until somebody
+// opened it and pressed connect (fazer-ai/chatwoot#577).
+//
+// The connect is `resumeConnect`'s.
+//
+// What comes back with the account is what the desired row remembers: the group
+// subscription and the call policy. The rest of a connect is not remembered on purpose:
+// a stored payload replayed here could be a request this build refuses, and a resume that
+// synthesised a refused command would leave the account down and in the sweep's backoff.
+func (m *Manager) Resume(sid string, wants store.Wants) bool {
+	if sid == "" {
+		return false
+	}
+	m.mu.RLock()
+	_, running := m.sessions[sid]
+	m.mu.RUnlock()
+	if running {
+		// Already this instance's, and a connect offered to a session that is up would
+		// dial a socket that is already there. The sweep asks about accounts nobody runs.
+		return false
+	}
+	delivery, built := m.resumeConnect(sid, wants)
+	if !built {
+		return false
+	}
+	return !m.own(delivery, m.reconnect)
+}
+
+// resumeConnect is the connect that puts an account back in the air with what its client
+// asked for, synthesised here because nobody is sending one: the sweep bringing back an
+// account nobody runs, and a `session.wake` for an account whose client asked for it to
+// be connected.
+//
+// The connect is a real command on the session's own queue. Everything a connect needs is
+// then what it has always had -- the executor, the order, the engine's own events -- and
+// the one thing that differs is that nobody is waiting for it, which is what `Internal`
+// says.
+func (m *Manager) resumeConnect(sid string, wants store.Wants) (*transport.Delivery, bool) {
+	payload, err := json.Marshal(resumeRequest(wants))
+	if err != nil {
+		// A string and a bool with no marshaller of their own: unreachable. Refused
+		// rather than sent half-built, and the next sweep asks for this account again.
+		m.log.Warn().Err(err).Str("sid", sid).Msg("could not build the connect to bring a session back")
+		return nil, false
+	}
+	return &transport.Delivery{
+		Command: protocol.Command{
+			V: protocol.Version, ID: m.newID(), Type: protocol.CommandSessionConnect, SID: sid,
+			Payload: payload,
+		},
+		// Nothing to acknowledge and nothing to leave pending: this command is not an
+		// entry on a stream, so the only thing a refusal costs is a pass, and the next
+		// sweep or wake asks again.
+		Ack:      func(context.Context) error { return nil },
+		Release:  func() {},
+		Internal: true,
+	}, true
+}
+
+// resumeRequest is the connect that brings an account back with what its client asked for:
+// the mode, and what the desired row remembers.
+func resumeRequest(wants store.Wants) engine.ConnectRequest {
+	// Built from the type the session decodes rather than spelled out as a literal, so
+	// what this writes and what reads it cannot drift: they are the same struct, and a
+	// field renamed on one side stops compiling instead of quietly setting nothing.
+	request := engine.ConnectRequest{Pairing: "resume", Groups: wants.Groups, HistorySync: wants.History}
+	if wants.CallAutoReject || wants.CallAnswer {
+		// Omitted rather than sent as `{auto_reject: false}`: a client that never asked
+		// about calls and one that asked for them to ring are the same request, and the
+		// contract spells the first as an absent object.
+		request.Calls = &engine.CallsRequest{AutoReject: wants.CallAutoReject, Answer: wants.CallAnswer}
+	}
+	if wants.Proxy != "" {
+		// Omitted for the same reason, and with more riding on it than the call policy:
+		// an account that asked for a proxy and is brought back without one dials
+		// WhatsApp from this instance's own address. The payload goes to this instance's
+		// own executor and nowhere else, so the credentials in it stay in this process.
+		request.Proxy = &engine.ProxyRequest{URL: wants.Proxy}
+	}
+	return request
+}
+
+// reconnect adopts an account that should be running and hands the synthesised connect to
+// it, on the goroutine that answers every wake.
+func (m *Manager) reconnect(ctx context.Context, delivery *transport.Delivery) {
+	sid := delivery.Command.SID
+	session, err := m.Adopt(ctx, sid)
+	if err != nil {
+		// Every reason to fail here is one a later pass may find gone: a peer that won
+		// the lease (the commonest, and the right outcome -- somebody is running it), an
+		// account this instance is handing back, a store that was away. Logged at debug
+		// because the ordinary case is a race the fleet is supposed to have.
+		m.log.Debug().Err(err).Str("sid", sid).Msg("could not take a session that should be running")
+		return
+	}
+	if session.Offer(delivery) != OfferAccepted {
+		m.log.Info().Str("sid", sid).Msg("a session that should be running had no room for the connect that would resume it")
+	}
+}
+
+func (m *Manager) pong(ctx context.Context, delivery *transport.Delivery) (failed error) {
+	command := delivery.Command
+	if expired(&command, m.now()) {
+		// The one control command where the ceiling is both cheap and right. A ping asks
+		// how many sessions this instance is running *now*, and answering it two minutes
+		// late with a count taken at the answer is a true sentence about the wrong
+		// instant, sent to a caller whose reply list has very likely expired. Nothing is
+		// started and nothing is torn down by refusing, which is what makes this
+		// different from the wake beside it: a wake retired is an account nobody starts.
+		refusal := protocol.NewError(protocol.ErrorExpired, "the command deadline passed before it was reached")
+		m.refuse(ctx, delivery, refusal)
+		return refusal
+	}
+	if command.ReplyTo != "" {
+		result, _ := json.Marshal(map[string]any{
+			"inst": m.instance, "version": protocol.Version, "sessions": m.Count(),
+		})
+		// Bounded here, the way a session bounds its own reply, and for a reason this
+		// used to get for free: the caller's context was a tick window, so a Redis that
+		// hung could not hold this past one. It is the manager's own goroutine now, and
+		// its context is the instance's lifetime -- long enough that an unbounded reply
+		// would stop every wake behind it, for as long as Redis stayed away.
+		answered, cancel := context.WithTimeout(context.WithoutCancel(ctx), ackTimeout)
+		err := m.replier.Reply(answered, command.ReplyTo, protocol.Reply{
+			V: protocol.Version, ID: command.ID, OK: true, Result: result,
+		})
+		cancel()
+		if err != nil {
+			m.log.Error().Err(err).Msg("failed to answer admin.ping")
+		}
+	}
+	m.ack(ctx, delivery)
+	return nil
+}
+
+func (m *Manager) refuse(ctx context.Context, delivery *transport.Delivery, failure *protocol.Error) {
+	command := delivery.Command
+	if command.ReplyTo != "" {
+		// Bounded for the same reason pong's is: see there.
+		answered, cancel := context.WithTimeout(context.WithoutCancel(ctx), ackTimeout)
+		_ = m.replier.Reply(answered, command.ReplyTo, protocol.Reply{
+			V: protocol.Version, ID: command.ID, OK: false, Error: failure,
+		})
+		cancel()
+	}
+	m.ack(ctx, delivery)
+}
+
+// stillHeard reports whether a refusal for this command would reach anybody.
+//
+// The caller's own deadline is the best evidence there is, and it outranks where the
+// command came from: a handoff hands a command back within milliseconds (ClaimSessions
+// claims with no minimum idle at all), and the caller that sent it is still blocked on
+// its reply. Refusing that one is backpressure the caller acts on; leaving it pending
+// would hold it until its queue drains or its own timeout runs out, having told it
+// nothing.
+//
+// Where no deadline was declared, provenance is the only evidence left. A command read
+// with `>` has just arrived, so somebody is waiting on the other end of it. A redelivered
+// one has been round the pending list since its holder died or lost the session, and its
+// reply list may not even exist any more.
+func (m *Manager) stillHeard(command *protocol.Command, redelivered bool) bool {
+	if command.ReplyTo == "" {
+		return false
+	}
+	if command.Deadline > 0 {
+		return !expired(command, m.now())
+	}
+	return !redelivered
+}
+
+// release says this instance is done with a delivery it did not carry out. A transport
+// that does not track its own in-flight work leaves it nil, and there is nothing to say.
+func release(delivery *transport.Delivery) {
+	if delivery.Release != nil {
+		delivery.Release()
+	}
+}
+
+// forfeit gives a command back the way an instance that tried it and failed gives it
+// back: still pending, but without the place in the queue that a command nobody has
+// touched keeps.
+func forfeit(delivery *transport.Delivery) {
+	if delivery.Forfeit != nil {
+		delivery.Forfeit()
+		return
+	}
+	release(delivery)
+}
+
+// ackTimeout bounds retiring a command that has already been carried out. Short,
+// because nothing waits on it.
+const ackTimeout = 2 * time.Second
+
+// ack retires a command, on a deadline of its own rather than the caller's.
+//
+// A batch is dispatched under a budget, so a command that finishes as that budget runs
+// out would have its acknowledgement refused by the deadline rather than by Redis. That
+// is not a retry: an entry whose ack did not land stays marked as being carried out here,
+// on purpose, so that a reclaim does not run it a second time — and every later claim
+// then skips it. In a fleet of one it is a command nothing retires until the process
+// restarts. The work is already done by this point; what is left is bookkeeping that has
+// to happen whether or not the batch had time for it.
+func (m *Manager) ack(ctx context.Context, delivery *transport.Delivery) {
+	retire, cancel := context.WithTimeout(context.WithoutCancel(ctx), ackTimeout)
+	defer cancel()
+	if err := delivery.Ack(retire); err != nil {
+		m.log.Error().Err(err).Str("cmd_id", delivery.Command.ID).Msg("failed to acknowledge a command")
+	}
+}
+
+// RenewAll keeps the leases of running sessions alive and tears down whatever this
+// instance has lost. It is the loop that turns "the lease expired" into "the socket is
+// closed", which is what keeps two instances off one account.
+func (m *Manager) RenewAll(ctx context.Context, by time.Time) {
+	// Renewals first, and nothing before them. Every hand-back is a Redis round trip
+	// that can hang, and a lease left unrenewed because this goroutine was busy with
+	// them is a session a peer takes while this instance still holds its socket open:
+	// the cost of a hand-back arriving a tick late is one session unowned for a few
+	// seconds, the cost of a renewal that never ran is every session on the instance.
+	//
+	// All of them in one round trip, so what the pass costs does not grow with how many
+	// sessions this instance carries. The tearing down that follows is per session by
+	// nature -- each one stops its own socket -- but it only touches the ones a renewal
+	// refused, which on an ordinary tick is none.
+	// By session and not by sid alone: an adoption replaces a retired session with a
+	// fresh one under the same sid, on another goroutine, and an answer about the session
+	// before it must not be carried out on the one that replaced it.
+	running := m.running()
+	sids := make([]string, 0, len(running))
+	for sid := range running {
+		sids = append(sids, sid)
+	}
+	renewals := m.leases.RenewMany(ctx, sids)
+
+	var released []string
+	for _, sid := range sids {
+		err := renewals[sid]
+		if err == nil {
+			continue
+		}
+		if !errors.Is(err, cluster.ErrNotOwner) {
+			if _, fresh := m.leases.Owned(sid); fresh {
+				// A Redis blip is not proof the lease moved, and the lease has not run
+				// out yet, so the right thing is to try again next tick rather than to
+				// hand a live session away on one failed round trip.
+				m.log.Warn().Err(err).Str("sid", sid).Msg("could not renew a lease")
+				continue
+			}
+			// It has run out. Whatever Redis is doing, a peer is now free to take this
+			// session, and a socket left open here would be the second one on the
+			// account: WhatsApp answers that by replacing the stream, and both owners
+			// write the same device meanwhile. Not knowing is the reason to let go, not
+			// a reason to hold on.
+			m.log.Warn().Err(err).Str("sid", sid).Msg("a lease went stale while unreachable; stopping the session")
+		} else {
+			m.log.Warn().Str("sid", sid).Msg("lost a lease; stopping the session")
+		}
+		session, still := m.drop(sid, running[sid])
+		m.lostLease(sid, still)
+		if !still {
+			// Adopted again since the renewal went out, which means a lease won after
+			// this answer was already stale. Stopping that session would leave an account
+			// nobody runs, and handing its lease back would delete a live one.
+			m.log.Warn().Str("sid", sid).
+				Msg("a session was adopted again while its renewal was in flight; leaving the new one alone")
+			continue
+		}
+		if errors.Is(err, cluster.ErrNotOwner) {
+			// Somebody else's now, and Renew has already forgotten it locally. Nothing
+			// to hand back and nothing to mark: both keys only ever answer to this
+			// instance's own name, so either would cost a round trip to be told no.
+			session.Stop()
+			continue
+		}
+		// The renewal may well have been applied and only the answer lost, which leaves
+		// a key naming this instance for a full TTL after the session it named stopped.
+		// Not knowing is the reason to hand it back explicitly rather than to wait the
+		// key out. Done below, with everything else that is not a renewal.
+		//
+		// Stopped first, and this is the one place the mark does not go before the stop.
+		// Everything that gets here failed to renew, so either the lease is gone or it is
+		// past being fresh, and Redis is often the reason: a mark asked for here waits
+		// out a network that is not answering, once per session, while the sockets those
+		// leases were covering are still open and peers are free to take the accounts.
+		// Not knowing is the reason to let go, not a reason to hold on, and the window
+		// the mark covers is at most the margin's worth of lease that is left.
+		session.Stop()
+		released = append(released, sid)
+	}
+
+	// What is left of the tick goes to the hand-backs, and only what a lease can spare
+	// of it. One that does not fit is tried again on the next tick.
+	window, cancel := context.WithDeadline(ctx, by)
+	defer cancel()
+	for _, sid := range released {
+		if !m.tryHoldHanding(sid) {
+			// An adoption of this account is under way. Handing back alongside it deletes
+			// the lease it wins; the mark `abandon` leaves is what brings this back on a
+			// later tick.
+			//
+			// Put back rather than left alone, because the adoption in the way may be the
+			// thing that cleared it. Marked as unwritten: what the adoption did to the key
+			// in Redis is not knowable from here.
+			m.orphanMu.Lock()
+			m.orphans[sid] = false
+			m.orphanMu.Unlock()
+			continue
+		}
+		m.abandon(window, sid)
+		m.dropHanding(sid)
+	}
+	m.giveBackRefusedTeardowns(window)
+	m.releaseOrphans(window)
+}
+
+// StopStale stops every running session whose lease this instance can no longer act on,
+// without asking Redis anything, and says how long until the next one would be.
+//
+// RenewAll does the same for a renewal that comes back refused, and that is the
+// trouble: it needs the answer. With Redis not answering, the renewal and everything
+// else on the tick wait out the client's timeouts and retries, and the answer that
+// would have said "stale" arrives with Redis itself. Meanwhile the store has refused
+// every write since the lease ran out -- it asks Owned, which is local -- while the
+// socket stays open, so whatsmeow cannot save the Signal state a message needs to be
+// decrypted, gives up on it, and WhatsApp counts it delivered (#353). The moment the
+// lease runs out is already known here, so the socket comes down at that moment, on a
+// goroutine nothing on Redis can hold.
+//
+// The lease is not handed back here: that is a round trip, and this exists for when
+// round trips do not come back. It is queued for the tick, which releases it once
+// Redis answers again.
+//
+// Each session is stopped on a goroutine of its own. Stop closes the socket and then
+// waits for the session to drain -- a publish in flight, a command being answered -- and
+// waited for here, one session draining would keep every other stale socket on this
+// instance open past its lease. The account stays marked as being handed back until its
+// own stop has finished, which is what keeps an adoption and the tick's release off a
+// socket that is still coming down.
+func (m *Manager) StopStale() time.Duration {
+	next := m.leases.TTL()
+	for sid, running := range m.running() {
+		if left := m.leases.Freshness(sid); left > 0 {
+			next = min(next, left)
+			continue
+		}
+		if !m.tryHoldHanding(sid) {
+			// Something else is acting on this account this instant: an adoption checking
+			// it, a hand-back in flight. Asked again shortly rather than at the next lease.
+			next = min(next, staleRetry)
+			continue
+		}
+		session, still := m.drop(sid, running)
+		if !still {
+			m.dropHanding(sid)
+			continue
+		}
+		m.log.Warn().Str("sid", sid).Msg("a lease ran out before it could be renewed; stopping the session")
+		m.lostLease(sid, true)
+		m.orphanMu.Lock()
+		if _, queued := m.orphans[sid]; !queued {
+			m.orphans[sid] = false
+		}
+		m.orphanMu.Unlock()
+		m.stopsInFlight.Add(1)
+		go func() {
+			defer m.stopsInFlight.Done()
+			defer m.dropHanding(sid)
+			session.Stop()
+		}()
+	}
+	return next
+}
+
+// staleRetry is how soon StopStale looks again at a stale session it could not take
+// because something else held it.
+const staleRetry = 50 * time.Millisecond
+
+// HandBackBy is the moment every hand-back in one tick has to be done by, counted from
+// the call rather than per pass.
+//
+// One deadline and not one per pass, because the tick has two: the renewals hand back
+// what they lost, and the sweep hands back what the engine finished with. Two windows of
+// a third of a lease each, back to back, is a renewal that can be two thirds of a lease
+// late -- and the startup check that decides whether a lease TTL is configurable at all
+// prices in exactly one of them (app.Config, "the lease hand-back tail"). A second one
+// nobody priced is a lease lost under load, which is a peer running an account whose
+// socket this instance still holds open.
+func (m *Manager) HandBackBy() time.Time {
+	return m.now().Add(m.leases.TTL() / ReleaseShare)
+}
+
+// ReleaseShare is the fraction of a lease one tick may spend handing leases back, which
+// leaves the rest of it for the renewals that already ran and the ones on the next tick.
+// Exported because the startup timing check is built on it, and the check has to be the
+// same arithmetic as the wiring: a bound the check reads from a constant of its own is a
+// bound that drifts the day either one is tuned.
+const ReleaseShare = 3
+
+// HandBack is what a StopAll did with the leases it owed: how many there were, and how
+// many of their hand-backs had still not reached Redis when it returned. Those expire on
+// their own, a lease TTL from now.
+type HandBack struct {
+	Owed       int
+	Unreturned int
+}
+
+// StopAll releases every session, which is what a SIGTERM does before the process
+// exits: a released lease is one a peer can take immediately instead of waiting a full
+// TTL for it to expire. It counts every lease it owes, including the hand-backs of
+// sessions stopped earlier that are still queued, since those are retried here too.
+func (m *Manager) StopAll(ctx context.Context) HandBack {
+	owed := m.owedHandBacks()
+	m.stopAll(ctx)
+	return HandBack{Owed: len(owed), Unreturned: m.unreturned(owed)}
+}
+
+func (m *Manager) stopAll(ctx context.Context) {
+	// Deferred, because the stops below have a way out before their end: a run where every
+	// session left is too close to its lease's end to mark returns from the loop. The
+	// sessions the lease watcher was taking down are out of the map, so nothing below
+	// reaches them. Their stops finish here, before the caller closes the Redis and the
+	// store a command being finished is still writing to, and their leases go back with
+	// the rest.
+	defer func() {
+		m.stopsInFlight.Wait()
+		m.releaseOrphans(ctx)
+	}()
+	sids := m.SIDs()
+	// All of them in one round trip, ahead of every stop, and this is the shape rather
+	// than a mark per Release because the releases are serial: a Redis that answers
+	// nothing would otherwise be waited out once per session, in front of each socket in
+	// turn, and the last one on the list would still be talking to WhatsApp long after
+	// the lease a peer can take its account on had expired.
+	//
+	// What a mark per session would have spent is then not spent at all: the stops below
+	// go straight through, and the hand-backs behind them carry whatever retry the batch
+	// still deserves.
+	// The leases with nothing left to give come down, and go back, before anything blocks
+	// on Redis for anybody else. No mark could outlive them, so waiting for one -- even a
+	// batch they are not in -- buys nothing and spends the last of a lease a peer is
+	// about to be free to take, with this instance still talking to WhatsApp on the
+	// account. Their own mark goes out with their release, one round trip behind a socket
+	// that is already down, which is the shortest window a hand-back can have.
+	//
+	// Asked again after every pass, because passing time is what puts a lease in this
+	// group: the stops and releases here spend exactly the room the rest were just
+	// measured to have. A split taken once and acted on for a whole shutdown is a split
+	// that was true when it was taken.
+	for {
+		ahead, ending := m.roomToMark(sids)
+		sids = ahead
+		if len(ending) == 0 {
+			break
+		}
+		for _, sid := range ending {
+			m.stopSession(sid)
+		}
+		// Every socket in the group down before any of their leases goes back, for the
+		// reason the batch below exists at all: a hand-back is a round trip that can
+		// hang, and one interleaved with these stops is an account still talking to
+		// WhatsApp because the account before it is waiting on a Redis that does not
+		// answer.
+		for _, sid := range ending {
+			m.abandon(ctx, sid)
+		}
+		if len(sids) == 0 {
+			return
+		}
+	}
+
+	m.givingUpAll(ctx, sids)
+	for _, sid := range sids {
+		m.stopSession(sid)
+	}
+	// Only now, with every socket already down. A hand-back is a round trip that can
+	// hang, and one interleaved with the stops is an account still talking to WhatsApp
+	// because the account before it is waiting on a Redis that does not answer.
+	for _, sid := range sids {
+		m.abandon(ctx, sid)
+	}
+}
+
+// roomToMark splits a shutdown's list into the leases worth marking before their stops
+// and the ones that have to be stopped first.
+//
+// Local, and deliberately so: it decides the order everything below runs in, and a split
+// that had to ask Redis would be one more thing in front of the sockets it is protecting.
+//
+// In practice one side of this split is almost always empty, and it is worth knowing why
+// before hardening it further. Leases are renewed in one pipelined batch and stamped with
+// one reading of the clock, so an instance's leases do not merely age together: Redis
+// gives them the same expiry, to the millisecond. A session adopted between ticks is
+// stamped when it is acquired, which makes it newer than the rest and never older; and
+// one whose renewal fails on its own is stopped by the sweep rather than kept with a
+// stale lease. What that leaves is the two ends: every lease with room, which is the
+// ordinary tick, or every lease without it, which is an instance that stopped renewing
+// for about a whole TTL -- a frozen process, a long pause, a suspended machine. A single
+// lease near its end among fresh ones would need a per-session failure inside a batch
+// that fails as one.
+func (m *Manager) roomToMark(sids []string) (ahead, ending []string) {
+	room := m.marking()
+	for _, sid := range sids {
+		if m.leases.Freshness(sid) < room {
+			ending = append(ending, sid)
+			continue
+		}
+		ahead = append(ahead, sid)
+	}
+	return ahead, ending
+}
+
+// givingUpAll marks a whole batch of hand-backs in front of their stops, under one bound
+// and one round trip. Every session in it has a whole bound of lease to spend, which is
+// what roomToMark decided.
+func (m *Manager) givingUpAll(ctx context.Context, sids []string) {
+	unmarked := make([]string, 0, len(sids))
+	m.orphanMu.Lock()
+	for _, sid := range sids {
+		if marked := m.orphans[sid]; !marked {
+			unmarked = append(unmarked, sid)
+			m.orphans[sid] = false
+		}
+	}
+	m.orphanMu.Unlock()
+	if len(unmarked) == 0 {
+		return
+	}
+
+	// The whole bound, not one shrunk to fit the tightest lease in the batch: a deadline
+	// sized by its most nearly expired member is one that can run out before the request
+	// is even sent, and then nothing in it is marked. Which leases belong here is
+	// roomToMark's answer, and every one of them has a bound of its own to spend.
+	marking, done := context.WithTimeout(ctx, m.sharing(ctx, m.marking()))
+	err := m.leases.MarkManyHandingBack(marking, unmarked)
+	done()
+	if err != nil {
+		m.log.Warn().Err(err).Int("sessions", len(unmarked)).
+			Msg("could not mark hand-backs for peers to see; handing back anyway")
+		return
+	}
+	m.orphanMu.Lock()
+	for _, sid := range unmarked {
+		// Only where the session is still one this instance is giving up, for the reason
+		// givingUp gives: an adoption that won the account back must not be left carrying
+		// a mark that says it is on its way out.
+		if _, still := m.orphans[sid]; still {
+			m.orphans[sid] = true
+		}
+	}
+	m.orphanMu.Unlock()
+}
+
+// SweepRetired hands back the lease of every session the engine has finished with.
+//
+// On the heartbeat, beside the renewals, because it is the same bookkeeping: a session
+// this instance has stopped working on is renewed forever otherwise, and while the lease
+// stands no peer tries the account. `RenewAll` deliberately renews without looking at
+// whether a session is connected -- a renewal skipped mid-reconnect hands an account to a
+// peer while this instance still holds a socket -- and this is not that check. The engine
+// has said the socket is down and staying down.
+//
+// Releasing stops the session and hands the lease back, so the account is owned by nobody
+// until a command adopts it again. Nothing here reconnects on its own, so the next attempt
+// is the client's to make, and it may land on any instance.
+func (m *Manager) SweepRetired(ctx context.Context, by time.Time) {
+	m.mu.RLock()
+	retired := make(map[string]*Session, len(m.sessions))
+	for sid, session := range m.sessions {
+		if session.Retired() {
+			retired[sid] = session
+		}
+	}
+	m.mu.RUnlock()
+
+	// The same deadline `RenewAll`'s own hand-backs ran under, and what they left of it:
+	// each release is a Redis round trip that can hang, and a heartbeat that spends longer
+	// than a lease here is every other session on this instance left unrenewed -- peers
+	// take them while the sockets are still open. One that does not fit is swept on the
+	// next tick, which costs an account a few more seconds of belonging to nobody.
+	window, cancel := context.WithDeadline(ctx, by)
+	defer cancel()
+	for sid, session := range retired {
+		if window.Err() != nil {
+			m.log.Warn().Str("sid", sid).
+				Msg("ran out of tick before handing back a retired session; will try again")
+			return
+		}
+		m.log.Info().Str("sid", sid).
+			Msg("handing back a session the engine will not bring back on its own")
+		// Counted as a failure before the account goes back, because that is what it is:
+		// the engine has nothing left to try -- a build WhatsApp refuses, a ban, an
+		// account that was unlinked -- and the resume sweep would otherwise find the
+		// account free a minute later and start the same attempt again.
+		//
+		// A teardown ends here too, and striking that one is wrong and harmless: the
+		// account is gone, nothing will ask about it again, and the record expires on its
+		// own. Telling the two apart at this point would mean the sweep reading a reason
+		// off a session that has already stopped.
+		m.failing(window, sid)
+		m.releaseThis(window, sid, session)
+	}
+}
+
+// waitingOut reports whether the fleet is leaving this account alone, and until when.
+//
+// One HGET on the goroutine that answers a manager's own commands, which is where every
+// wake is carried out and is not the one that renews leases: Dispatch queues through
+// `own` and Answer runs it, so this spends no part of a renewal's budget. Bounded anyway,
+// like everything else there. What it costs is paid only where it saves something: a wake
+// being acted on is read once and never comes back, so the read happens exactly on the
+// repeats that would otherwise each have paid for an adoption.
+//
+// A read that failed answers "not waiting". Not knowing is a reason to try rather than a
+// reason to hold back: the quarantine paces what the connector does on its own, and a
+// Redis that did not answer is no evidence about the account.
+func (m *Manager) waitingOut(ctx context.Context, sid string) (time.Time, bool) {
+	if m.quarantine == nil {
+		return time.Time{}, false
+	}
+	read, cancel := context.WithTimeout(ctx, ackTimeout)
+	defer cancel()
+	waiting, err := m.quarantine.Waiting(read, []string{sid})
+	if err != nil {
+		m.log.Warn().Err(err).Str("sid", sid).
+			Msg("could not read whether a session is being left alone; trying it")
+		return time.Time{}, false
+	}
+	until, found := waiting[sid]
+	return until, found
+}
+
+// working forgets a session's failures, which is what a connection that came up means.
+//
+// Bounded and detached, because it is called from the pump: the goroutine that publishes
+// what the engine says must not wait on Redis for longer than it would wait to publish.
+// A clear that does not land costs the account a wait it has already outgrown, and the
+// next connection clears it again.
+func (m *Manager) working(ctx context.Context, sid string) {
+	if m.quarantine == nil {
+		return
+	}
+	forget, cancel := context.WithTimeout(ctx, ackTimeout)
+	defer cancel()
+	if err := m.quarantine.Clear(forget, sid); err != nil {
+		m.log.Warn().Err(err).Str("sid", sid).Msg("could not clear the failures of a session that is connected")
+	}
+}
+
+// failing records one more failure for a session the connector could not bring back, and
+// says how long the fleet will now leave it alone.
+//
+// Bounded and detached for the reason working is: it is called from the executor, where
+// what waits behind it is every command for this account.
+//
+// A share of the caller's window rather than all of it, and that is load-bearing at both
+// call sites: a hand-back runs immediately behind this one, and `ackTimeout` is the same
+// two seconds `releaseTimeout` is, so a strike against a Redis that has stopped answering
+// would spend the whole budget and hand `abandon` a context that has already expired. The
+// lease of a session that never opened would then stay held, and every peer is blocked on
+// it until a later tick gets round to the orphan -- which is the opposite of what letting
+// the account go is for.
+//
+// The order is not the thing to change here, though it looks like the cheaper fix. The
+// strike goes first on purpose: release the lease and a peer's resume sweep finds the
+// account free with nothing yet saying to leave it alone, and starts the same attempt
+// over. Sharing keeps that ordering and still leaves the hand-back a window to land in.
+func (m *Manager) failing(ctx context.Context, sid string) {
+	if m.quarantine == nil {
+		return
+	}
+	count, cancel := context.WithTimeout(ctx, m.sharing(ctx, ackTimeout))
+	defer cancel()
+	until, err := m.quarantine.Strike(count, sid)
+	if err != nil {
+		m.log.Warn().Err(err).Str("sid", sid).Msg("could not record that a session failed to come back")
+		return
+	}
+	m.log.Info().Str("sid", sid).Time("until", until).
+		Msg("a session the connector could not keep in the air; leaving it alone until then")
+}
+
+// releaseThis hands a session back only while it is still the one that was found.
+//
+// Adoptions run on the answer goroutine and this runs on the heartbeat, so between the
+// two lines above a wake can release this very session, win the lease again and put a
+// fresh one in its place -- Adopt does exactly that for a retired session. Released by
+// sid alone, this would then stop the session that just started and delete the lease it
+// is running under.
+//
+// The pointer answers for a replacement that has already landed; `handing` answers for
+// one that is still being built, because the release that overtakes an adoption deletes
+// a live lease -- `cluster.Release` matches on the instance and nothing else.
+// tryHoldHanding takes the turn for one account, or says it is taken.
+//
+// Nobody waits on it. The heartbeat has other sessions to renew and cannot spend a tick
+// on one; an adoption runs on the goroutine that answers every wake and ping, and one
+// waiting here would hold all of them behind an account it has been told is on its way
+// out -- which is a wake to leave pending, not one to wait for. Two adoptions of the same
+// account cannot contend, being the same goroutine.
+func (m *Manager) tryHoldHanding(sid string) bool {
+	m.handingMu.Lock()
+	defer m.handingMu.Unlock()
+	if _, busy := m.handingBusy[sid]; busy {
+		return false
+	}
+	m.handingBusy[sid] = struct{}{}
+	return true
+}
+
+func (m *Manager) dropHanding(sid string) {
+	m.handingMu.Lock()
+	delete(m.handingBusy, sid)
+	m.handingMu.Unlock()
+}
+
+// forget takes a session out of the map and stops it, unless the map no longer holds the
+// one the caller was looking at.
+//
+// Adoptions run on the answer goroutine, and one of them replaces a retired session with
+// a fresh one under the same sid. A caller acting on an answer about the session before
+// it -- a renewal that was refused, a sweep that found it finished with -- would then
+// stop a session that is running and leave the lease it won behind.
+func (m *Manager) forget(ctx context.Context, sid string, want *Session) bool {
+	session, ok := m.drop(sid, want)
+	if !ok {
+		return false
+	}
+	// Here rather than at the callers, and here rather than before the lookup, for the
+	// two reasons Release gives: the stop is what opens the window, and the session this
+	// is about is only settled once the lookup has agreed it is the one asked for. A mark
+	// written ahead of that names a session the instance turns out to be running.
+	m.givingUpAhead(ctx, sid)
+	session.Stop()
+	return true
+}
+
+// drop takes a session out of the map, if it is still the one the caller means, and
+// hands it back to be stopped.
+//
+// Taking it out and stopping it are separate because what belongs between them is not
+// the same everywhere: an instance giving a lease up has to say so before the stop, and
+// one whose lease is already somebody else's has nothing to say and no key that would
+// answer to its name.
+func (m *Manager) drop(sid string, want *Session) (*Session, bool) {
+	m.mu.Lock()
+	session, ok := m.sessions[sid]
+	if ok && session == want {
+		delete(m.sessions, sid)
+	}
+	m.mu.Unlock()
+	if !ok || session != want {
+		return nil, false
+	}
+	return session, true
+}
+
+func (m *Manager) releaseThis(ctx context.Context, sid string, want *Session) {
+	_ = m.releaseClaimed(ctx, sid, want, want.claim)
+}
+
+// releaseIdle is releaseThis for a session that was never retired: the account opened to
+// serve a teardown the executor refused before it ran. It reports whether the account
+// actually went back, because the caller is the only thing that will ever look at this
+// session again and has to keep it on its list until it did.
+func (m *Manager) releaseIdle(ctx context.Context, sid string, was adoptedForDelete) bool {
+	return m.releaseClaimed(ctx, sid, was.session, func() bool {
+		// Asked again here rather than trusted from the pass above, because the two are a
+		// tick apart and the gate is what makes this the only adoption of the account in
+		// flight: a `session.wake` landing in between is answered with this very session
+		// and acknowledged, which takes the entry off the list and leaves nothing in the
+		// count to notice. Without this the heartbeat would hand away an account the fleet
+		// has just been told to keep up.
+		m.forDeleteMu.Lock()
+		entry, listed := m.forDelete[sid]
+		m.forDeleteMu.Unlock()
+		if !listed || entry != was {
+			return false
+		}
+		return was.session.claimIdle(was.carried)
+	})
+}
+
+func (m *Manager) releaseClaimed(ctx context.Context, sid string, want *Session, claim func() bool) bool {
+	if !m.tryHoldHanding(sid) {
+		// An adoption of this account is under way. Tried and not taken: this runs on the
+		// heartbeat, and an adoption reads a store.
+		m.log.Debug().Str("sid", sid).
+			Msg("an adoption is under way; leaving a retired session for the next tick")
+		return false
+	}
+	defer m.dropHanding(sid)
+
+	// Asked again with the turn in hand, and the session locked shut in the same step,
+	// because the sweep found it a step earlier: a command taken off its queue before the
+	// door shut is one no door can call back, and a connect among them can put a socket up
+	// in between. Stopping it then would close a socket the client has just been told is
+	// open, and hand back the lease it is running under.
+	if !claim() {
+		m.log.Info().Str("sid", sid).
+			Msg("a session finished with was not free to be handed over; leaving it for the next tick")
+		return false
+	}
+	if !m.forget(ctx, sid, want) {
+		return false
+	}
+	m.abandon(ctx, sid)
+	return true
+}
+
+// reportCommand is `Session.reportCommand` for the commands that never reach a session.
+//
+// The two of them are the whole of what this instance answers: `admin.ping`, which no
+// session owns, and the `rate_limited` refusal a full queue produces. Leaving them out
+// was the defect -- the outcome distribution would omit exactly the overload refusals an
+// operator goes looking for, and it would omit them precisely when there are most of
+// them, because that is when the queue is full.
+//
+// Timed from the dispatch that picked the command up rather than from the answer, since
+// what a caller waited for is the queueing, not the reply.
+func (m *Manager) reportCommand(command *protocol.Command, began time.Time, err error) {
+	if m.watch == nil {
+		return
+	}
+	outcome := "ok"
+	if err != nil {
+		outcome = string(asProtocolError(err).Code)
+	}
+	m.watch.CommandDone(command.Type, outcome, m.now().Sub(began))
+}
+
+// lostLease counts a lease this instance stopped running a session over.
+//
+// Takes whether the drop found the session it was looking at, and counts nothing when it
+// did not: a renewal that came back unlucky while the account was already released, or
+// adopted again by this same instance, stopped nothing, and counting it would report an
+// ordinary concurrent release as a lease lost. Both losing branches feed it, because both
+// are this instance ceasing to own a session it was running; an ordinary shutdown does
+// not, which is why this is not inside `drop`. A fleet coming down cleanly is not a flap,
+// and a counter that says it is buries the shape it exists to show.
+func (m *Manager) lostLease(sid string, stopped bool) {
+	if !stopped || m.watch == nil {
+		return
+	}
+	m.watch.LeaseLost(sid)
+}

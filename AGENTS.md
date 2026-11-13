@@ -1,0 +1,186 @@
+# whatsapp-connector Development Guidelines
+
+Go service that owns WhatsApp sessions and exchanges canonical events and commands
+with its clients over Redis Streams. The wire contract in `contract/` is the source
+of truth for both sides; this repository is the side that produces events.
+
+## Build / Test / Lint
+
+- **Setup a fresh clone**: `make setup` (installs the git hooks and downloads modules)
+- **Lint**: `make lint` — `make fmt` rewrites what is auto-fixable
+- **Test**: `make test` (race detector on) — a single one with `go test ./internal/protocol -run TestName`
+- **The other dialect**: `make test-postgres` runs the same suite against a PostgreSQL
+  server named by `WAC_TEST_DATABASE_URL`, which is what a deployment runs and what
+  `make test` never touches. `make test-redis` is the same idea for the transport against
+  a real Redis. Both print how to start a server when the variable is unset
+- **Contract only**: `make contract`
+- **Everything CI enforces**: `make check` — lint, `go mod tidy`, and the suite three
+  times over: SQLite, PostgreSQL, and the transport against real Redis. It needs a server
+  for each of the last two and **fails when it cannot reach them**. It used to skip them
+  with a notice and exit 0, which answered "CI will accept this" on evidence it had not
+  collected; a single test file with no production lines once aborted the whole package
+  under PostgreSQL and passed that way
+- **Adding a gate to CI means adding it to the Makefile**: `.github/workflows/ci.yml`
+  calls the targets instead of spelling the commands a second time, and
+  `internal/toolchain` fails the suite when a workflow step runs something `make check`
+  does not reach. A step that genuinely belongs to CI alone (the lint action, the image
+  build) goes in one of that file's two lists, with the reason. Two hand-written lists is
+  what this replaced, and they had already drifted: CI ran `go mod tidy -diff` and `make
+  check` did not
+- **The half that needs nothing running**: `make check-offline` (lint, `go mod tidy`, the
+  SQLite pass). It names the two passes it did not run when it finishes, and it is what the
+  agent stop hook falls back to, so ending a turn without Docker running does not fail for a
+  reason that is not the turn's. The versioned `pre-commit` hook runs neither target: gofmt
+  on the staged files, `go vet` and the contract test, and it is meant to stay under a second
+- **Toolchain**: Go as declared in `go.mod`; `golangci-lint` v2
+
+## Layout
+
+```
+cmd/connector/       binary: serve, healthcheck, version, help
+contract/            protocol vN: JSON Schema + golden fixtures (language neutral, no Go here)
+internal/protocol/   Go binding for the contract: frames, type catalog, error codes
+internal/transport/  how frames travel (Redis Streams today, HTTP standalone later)
+internal/cluster/    leases, epochs, the instance registry -- who owns a session
+internal/session/    session lifecycle, state machine, per-session FIFO executor
+internal/engine/     the WhatsApp side behind an interface (whatsmeow, plus a fake for tests)
+internal/store/      Postgres/SQLite persistence, fenced against a lost lease
+internal/media/      blob store, inbound download, outbound fetch
+```
+
+## Where the docs go
+
+- `README.md` (PT-BR) and `README-en.md` are the product page, in the shape of the
+  `fazer-ai/chatwoot` and `fazer-ai/agents` READMEs: what it is, what it does, how to
+  install it next to Chatwoot, limitations, links. They are authorial text, so their prose
+  is drafted by Codex from a brief and edited here, never written by hand; the two stay in
+  step, and a change to one is a change to both.
+- Everything technical is in English and lives elsewhere: `docs/operations.md` (running,
+  the configuration table, Redis), `docs/deployment.md` (the two ways to run it next to
+  Chatwoot, with the composes in `examples/`), `docs/architecture.md`, `docs/limitations.md`,
+  `docs/roadmap.md`, and `CONTRIBUTING.md` (development, the fleet bench, changing the
+  protocol). A new environment variable goes in the `docs/operations.md` table; the README
+  lists only the minimum to get a session up.
+
+## The contract comes first
+
+- `contract/` is language neutral. Never put Go (or any other language) files in it:
+  clients vendor the directory verbatim and compare checksums, so an extra file
+  shows up as drift on their side.
+- **The prose has two halves, and only one of them travels.** `contract/PROTOCOL.md` is the
+  contract a client is held to: transport, compatibility, conventions, RPC results. It is
+  vendored and counted in the client's checksum. `contract/README.md` is orientation for
+  somebody reading the directory here, and the Chatwoot sync deletes it, so anything written
+  there is invisible to the side it addresses. Every obligation on the consuming side goes in
+  `PROTOCOL.md`; `internal/protocol/contract_prose_test.go` fails the suite when one lands in
+  the README instead. #222 shipped a client obligation into the half that does not travel with
+  the suite and CI green, because until #223 nothing read that file.
+- Changing a frame means changing `contract/schema/protocol.schema.json`, adding or
+  updating a fixture in `contract/fixtures/`, and updating `internal/protocol`. The
+  contract test fails when a frame **type** has no fixture, when a fixture names a type
+  this build does not know, or when a fixture does not validate against the schema.
+- Values **inside** a payload are held to the schema, not to the fixtures: every enum
+  with a catalogue in `internal/protocol` (`AllErrorCodes`, `AllMediaKinds`, and the
+  rest) is compared against its enum in the schema, exactly, and there is no fixture per
+  value. A fixture pins a frame's shape, and one `command.failed` has the same shape
+  whichever error code it carries -- a file per value would multiply what a change to
+  that shape costs a vendoring client without multiplying what it proves. A new enum
+  gets a catalogue and a row in `TestPayloadEnumsMatchSchema`, listing every path the
+  schema spells it out at; one the Go side carries as a plain string is listed as
+  unchecked instead. `TestEverySchemaEnumIsAccountedFor` fails until it is one or the
+  other, so an enum cannot be added to the contract and quietly go uncompared.
+- **Additive changes** (a new event type, a new optional field) do not bump
+  `contract/PROTOCOL_VERSION`. Clients are written to ignore what they do not know.
+- **Breaking changes** bump it, and the connector keeps serving the previous major
+  for one release cycle: `MinVersion`..`Version` is advertised in the instance
+  registry and a client refuses to talk when the ranges do not overlap.
+- After a `contract/` change lands, the Chatwoot side re-pins its copy with
+  `bundle exec rails whatsapp:contract:sync[<ref>]`. Say so in the PR description.
+- Addresses on the wire are canonical (`{kind, id}`), never raw JIDs; timestamps are
+  epoch milliseconds; media never travels inside a frame.
+
+## Code Style
+
+- Standard Go style, enforced by `golangci-lint` (formatting included). Do not hand
+  format around it.
+- **Errors**: wrap with `%w` and enough context to locate the session
+  (`fmt.Errorf("send %s: %w", sid, err)`). Sentinel errors for what callers branch
+  on. Everything that crosses the wire degrades to a `protocol.ErrorCode`; unknown
+  codes become `internal` rather than leaking raw text into a client's UI.
+- **Context**: every blocking call takes a `context.Context` and honours it. No
+  naked `time.Sleep` in production paths; use a timer plus `ctx.Done()`.
+- **Concurrency**: one goroutine owns one session. Cross-goroutine state goes through
+  the session executor or the store, not through shared mutable structs.
+- **Logging**: structured (`zerolog`), always with `sid` and, where relevant,
+  `epoch`, `type` and `cmd_id`. Never log message bodies, media contents or auth
+  state; phone numbers are redacted by the logger, do not bypass it.
+- Prefer the smallest production-ready change. Do not add speculative guards,
+  fallbacks or retries unless a caller can actually reach that state.
+- When an impossible or misconfigured state means a deployment bug, fail loudly
+  instead of silently degrading.
+- Remove dead code instead of commenting it out; do not keep two versions of the
+  same logic side by side.
+
+## Testing
+
+- New behaviour ships with tests: happy path plus the edge cases that motivated it.
+  Bugfixes get a regression test when the fix is not cosmetic.
+- Table-driven tests, `t.Run` subtests, and fixtures from `contract/` wherever a
+  frame is involved.
+- The WhatsApp side is behind `engine.Engine`: unit tests use the fake engine, never
+  a real socket. Redis-backed tests use `miniredis`, except the handful of stream
+  tests that need `XAUTOCLAIM` semantics a fake does not reproduce.
+- Tests must be deterministic and safe under `-race`: no wall-clock sleeps to
+  synchronise, no reliance on map iteration order, no shared global state.
+- Anything touching ownership (leases, epochs, fencing) needs a test with two
+  simulated instances. That is where the dangerous bugs live.
+
+## Operational invariants
+
+These are load-bearing. If a change makes one of them false, it is a design change,
+not an implementation detail:
+
+1. One instance owns a session at a time, arbitrated by a Redis lease. Losing the
+   lease disconnects the socket immediately and fences the store writes.
+2. Every event carries the owner's `epoch`. Clients drop session state from a stale
+   epoch, so the epoch must increase on every ownership change.
+3. `seq` is monotonic per `(sid, epoch)`, and a session always lands on the same
+   event shard, which is what gives the client ordering.
+4. The WhatsApp ack for an inbound message is sent only after the event is published.
+   Losing Redis must cost a redelivery, never a message.
+5. Commands are idempotent by `message_id` (sends) or `idempotency_key` (everything
+   else): a redelivered command must not duplicate a side effect.
+
+## Commit Messages
+
+- Conventional Commits: `type(scope): subject`, enforced by the `commit-msg` hook.
+- Scope is the package or area: `feat(protocol):`, `fix(cluster):`, `chore(ci):`.
+- Don't reference Claude or any agent in commit messages.
+
+## Pull Requests
+
+- Start with a short paragraph on what changes for the operator or for the client.
+- Fill the **Protocol impact** section of the template; it is what tells the Chatwoot
+  side whether it has to move.
+- Default merge: `gh pr merge <n> --squash`.
+- CI (`lint`, `test`) must be green before merging.
+
+## Related repositories
+
+- `fazer-ai/chatwoot` — the client: `app/services/whatsapp/session/` consumes these
+  events and produces these commands.
+- `fazer-ai/baileys-api` — the previous generation (Node/Baileys), frozen. Its
+  `src/cluster/` is the reference implementation for the lease protocol ported here.
+
+## Upstream whatsmeow
+
+- **Never open an issue or a pull request on `tulir/whatsmeow`.** The project does not
+  accept AI-authored submissions, and a report filed from here is a report filed in that
+  repository's name for its maintainers to triage. This holds however small the change is
+  and however complete the diagnosis: the diagnosis goes in an issue **here**, with the
+  file and line, and the upstream fix is somebody else's to propose.
+- A whatsmeow defect we cannot work around is tracked as a known limitation in our own
+  backlog, with the pin it was measured on, so that a later pin bump has something to
+  check against. `internal/engine/whatsmeow/upstream_test.go` is the fence that fails when
+  one of them changes shape upstream, which is the signal to re-read the issue rather than
+  to trust that a bump fixed it.

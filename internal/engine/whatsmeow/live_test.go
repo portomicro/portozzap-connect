@@ -1,0 +1,2304 @@
+//go:build live
+
+// The live checks. They talk to WhatsApp with a real account and need a human holding
+// the phone, so they are behind a build tag and never run in CI or in `make check`.
+//
+// What they exist for: the failures left in this engine are the ones reading cannot
+// reach. A lock taken in the wrong order, an event arriving before the state it
+// describes, the 515 stream error WhatsApp sends in the middle of pairing, a device
+// that resumes on one boot and asks for a new code on the next. Every one of those
+// shows up within minutes of a real pairing and within none of a unit test.
+//
+// Run one phase at a time, in this order:
+//
+//	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLivePairWithQR
+//	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveResume
+//	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveHangUpAndBack
+//	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveListen
+//	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveMedia
+//	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveRefetch
+//	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveReuse
+//	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveViewOnce$
+//	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveWatchAMessageChange
+//	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveWatchAShare
+//	WAC_LIVE_TO=<number> go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveSend$
+//	WAC_LIVE_TO=<number> go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveSendMedia
+//	  (WAC_LIVE_FILE names the file; WAC_LIVE_VOICE=1 sends it as a voice note)
+//	WAC_LIVE_TO=<number> go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveSendLocation
+//	WAC_LIVE_TO=<number> go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveSendContacts
+//	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveLogout
+//
+// The store is deliberately not a t.TempDir: resuming is the thing being checked, and
+// a pairing that does not outlive the process proves nothing. Point WAC_LIVE_DB
+// somewhere durable, or accept the default under the user's state directory.
+//
+// A second account, paired the same way and driven from here, lives in
+// live_counterpart_test.go. The phases above still want a person for what only the phone
+// answers -- pairing, the passkey wall, whether a view-once is forwarded at all -- but
+// anything needing somebody on the other side of the conversation no longer does.
+package whatsmeow
+
+import (
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"mime"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"slices"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/rs/zerolog"
+	waTypes "go.mau.fi/whatsmeow/types"
+
+	"github.com/fazer-ai/whatsapp-connector/internal/engine"
+	"github.com/fazer-ai/whatsapp-connector/internal/media"
+	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+	"github.com/fazer-ai/whatsapp-connector/internal/store"
+)
+
+// liveSID is the account under test.
+const liveSID = "live-1"
+
+// liveCounterpartSID is the second account: the one on the other side of the
+// conversation, paired as a linked device like the first and driven from here.
+//
+// Every phase up to now had a person there, sending the message to react to and reading
+// the typing indicator. That was affordable while a phase asked for one or two actions.
+// Groups are not: creating one, adding and removing participants, promoting an admin,
+// changing the subject, an invite link -- each needs somebody on the other side, and each
+// review round runs the phase again.
+//
+// Two sids on one store and one engine, which is also what an instance running two
+// sessions looks like. A second store would be a shape production never has.
+const liveCounterpartSID = "live-2"
+
+// TestLivePairWithQR pairs by scanning. It is the first phase and the only one that
+// needs the phone in hand.
+func TestLivePairWithQR(t *testing.T) {
+	session, container := liveSession(t)
+	events := watch(t, session)
+
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "qr"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	events.await(t, protocol.EventPairingSuccess, liveDeadline(t, 5*time.Minute))
+	events.awaitState(t, "open", 2*time.Minute)
+
+	jid, bound, err := container.For(liveSID).JID(t.Context())
+	if err != nil || !bound {
+		t.Fatalf("the pairing was announced but nothing was written down (bound=%v, err=%v)", bound, err)
+	}
+	if jid.Device == 0 {
+		t.Fatalf("WhatsApp issued %s with no device part, which resume cannot key on", jid)
+	}
+	t.Logf("paired as %s", jid)
+}
+
+// TestLivePairWithCode pairs by typing an eight-character code into the phone. The
+// alternative to TestLivePairWithQR, not a step after it.
+func TestLivePairWithCode(t *testing.T) {
+	phone := os.Getenv("WAC_LIVE_PHONE")
+	if phone == "" {
+		t.Skip("set WAC_LIVE_PHONE to the number to pair, country code and no plus")
+	}
+
+	session, container := liveSession(t)
+	events := watch(t, session)
+
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "code", Phone: phone}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	events.await(t, protocol.EventPairingCode, 2*time.Minute)
+	events.await(t, protocol.EventPairingSuccess, liveDeadline(t, 5*time.Minute))
+	events.awaitState(t, "open", 2*time.Minute)
+
+	if _, bound, err := container.For(liveSID).JID(t.Context()); err != nil || !bound {
+		t.Fatalf("the pairing was announced but nothing was written down (bound=%v, err=%v)", bound, err)
+	}
+}
+
+// TestLiveResume is the one that catches a broken device key. It runs in a process
+// that never saw the pairing, which is exactly what a connector restart is.
+func TestLiveResume(t *testing.T) {
+	session, container := liveSession(t)
+
+	jid, bound, err := container.For(liveSID).JID(t.Context())
+	if err != nil || !bound {
+		t.Fatalf("nothing is paired yet; run TestLivePairWithQR first (err=%v)", err)
+	}
+
+	events := watch(t, session)
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	// Read the moment Connect returns, which is the moment the reply to
+	// `session.connect` is built. ConnectContext comes back once the socket is up and
+	// the handshake runs on from there, so this is the window where a session that is
+	// connecting perfectly well can be reported as closed.
+	if state := session.state(); state == "close" {
+		t.Fatal("a resume in progress reported itself closed, which is the reply the client acts on")
+	}
+
+	events.awaitState(t, "open", 2*time.Minute)
+
+	if events.count(protocol.EventPairingQR) > 0 {
+		t.Fatal("a resume asked for a new code, which means the stored device was not found")
+	}
+
+	status, err := session.Execute(t.Context(), &protocol.Command{Type: protocol.CommandSessionStatus})
+	if err != nil {
+		t.Fatalf("session.status: %v", err)
+	}
+	var reported map[string]any
+	if err := json.Unmarshal(status, &reported); err != nil {
+		t.Fatalf("unmarshal the status: %v", err)
+	}
+	if reported["connection"] != "open" {
+		t.Fatalf("connection=%v, want open", reported["connection"])
+	}
+	if reported["phone_number"] != jid.User {
+		t.Fatalf("phone_number=%v, want %s", reported["phone_number"], jid.User)
+	}
+}
+
+// TestLiveHangUpAndBack takes the socket down and brings it back on one session. A
+// hang-up that leaves the client believing it is still logged in, or a reconnect that
+// races the teardown, shows up here and nowhere in a unit test.
+func TestLiveHangUpAndBack(t *testing.T) {
+	session, _ := liveSession(t)
+	events := watch(t, session)
+
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	events.awaitState(t, "open", 2*time.Minute)
+
+	if err := session.Disconnect(t.Context()); err != nil {
+		t.Fatalf("Disconnect: %v", err)
+	}
+	events.awaitState(t, "close", 30*time.Second)
+
+	// A session that comes back has to come back on its own credentials, without a
+	// code and without a second device.
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect after a hang-up: %v", err)
+	}
+	events.awaitState(t, "open", 2*time.Minute)
+	if events.count(protocol.EventPairingQR) > 0 {
+		t.Fatal("coming back from a hang-up asked for a new code")
+	}
+}
+
+// TestLiveListen holds a paired session open and waits for a real message. A human
+// sends a text from another phone, and the phase passes only if it comes back out as
+// the event the contract names: it is the one check that the whole inbound path works
+// against WhatsApp rather than against a fixture.
+func TestLiveListen(t *testing.T) {
+	window := liveWindow(t, 2*time.Minute)
+
+	session, _ := liveSession(t)
+	events := watch(t, session)
+
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	events.awaitState(t, "open", 2*time.Minute)
+
+	fmt.Fprintf(os.Stderr, "send a text to the paired number now; waiting up to %s\n", window)
+	received := events.await(t, protocol.EventMessageReceived, window)
+
+	var body struct {
+		Message struct {
+			ID      string                      `json:"id"`
+			Chat    struct{ Kind, ID string }   `json:"chat"`
+			Content struct{ Type, Body string } `json:"content"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(received.Payload, &body); err != nil {
+		t.Fatalf("unmarshal the message: %v", err)
+	}
+	if body.Message.ID == "" || body.Message.Chat.ID == "" {
+		t.Fatalf("the message arrived without an id or a chat: %s", received.Payload)
+	}
+	if body.Message.Content.Type != "text" || body.Message.Content.Body == "" {
+		t.Fatalf("the message arrived without a text body: %s", received.Payload)
+	}
+	if state := session.state(); state != "open" {
+		t.Fatalf("the session did not stay up: state=%s", state)
+	}
+}
+
+// TestLiveWatchAMessageChange is M2.5's inbound half against a real phone: somebody on
+// the other side corrects a message, reacts to it, takes the reaction back and finally
+// deletes it, and each of those has to come back out as its own event naming the message
+// it is about.
+//
+// It is the phase no fixture can stand in for, and the first run proved it: the shapes
+// are whatsmeow's reading of what WhatsApp really sends, and what a phone really sends
+// for a correction turned out not to be the shape the library documents building. Two of
+// the four passed and the edit was refused, which is a thing only a phone could say.
+//
+// Everything is asked for at once and collected in whatever order it arrives. Waiting on
+// one step at a time reads better and is wrong: a step that never lands sits on the
+// events of every step after it, and the run then reports the one thing it was waiting
+// for instead of everything it saw.
+func TestLiveWatchAMessageChange(t *testing.T) {
+	window := liveWindow(t, 5*time.Minute)
+
+	session, _ := liveSession(t)
+	events := watch(t, session)
+
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	events.awaitState(t, "open", 2*time.Minute)
+
+	target, _ := liveAwaitTheirMessage(t, events, window)
+	fmt.Fprintf(os.Stderr,
+		"now, on the other phone, to that message: edit it, react to it, take the reaction back, delete it for everyone.\nwaiting up to %s\n",
+		window)
+
+	var edited, revoked engine.Emission
+	var reactions []*engine.Emission
+	deadline := time.After(window)
+
+collect:
+	for {
+		select {
+		case emission, ok := <-events.seen:
+			if !ok {
+				t.Fatal("the session ended before the phase finished")
+			}
+			switch emission.Type {
+			case protocol.EventMessageEdited:
+				edited = emission
+			case protocol.EventMessageRevoked:
+				revoked = emission
+			case protocol.EventMessageReaction:
+				// Kept whole rather than counted: a reaction on some other message in
+				// the account would otherwise be read as the answer to one of these.
+				reactions = append(reactions, &emission)
+			}
+			if edited.Type != "" && revoked.Type != "" && len(reactions) >= 2 {
+				break collect
+			}
+		case <-deadline:
+			break collect
+		}
+	}
+
+	missing := []string{}
+	if edited.Type == "" {
+		missing = append(missing, "the correction")
+	}
+	if revoked.Type == "" {
+		missing = append(missing, "the deletion")
+	}
+	if len(reactions) < 2 {
+		missing = append(missing, fmt.Sprintf("%d of the two reactions", 2-len(reactions)))
+	}
+	if len(missing) > 0 {
+		// All of them at once. Reporting only the first leaves a second run to find the
+		// second, and every run of this phase costs a human at a phone.
+		t.Fatalf("%s never arrived within %s", strings.Join(missing, " and "), window)
+	}
+
+	liveCheckTheCorrection(t, &edited, target)
+	liveCheckTheReactions(t, reactions, target)
+	liveCheckTheDeletion(t, &revoked, target)
+
+	if state := session.state(); state != "open" {
+		t.Fatalf("the session did not stay up: state=%s", state)
+	}
+}
+
+func liveCheckTheCorrection(t *testing.T, emission *engine.Emission, target string) {
+	t.Helper()
+
+	var correction struct {
+		MessageID string `json:"message_id"`
+		FromMe    bool   `json:"from_me"`
+		Content   struct {
+			Type string `json:"type"`
+			Body string `json:"body"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(emission.Payload, &correction); err != nil {
+		t.Fatalf("unmarshal the edit: %v", err)
+	}
+	switch {
+	case correction.MessageID != target:
+		// The stanza carrying a correction has an id of its own, and publishing that one
+		// leaves the client looking for a message nobody ever stored.
+		t.Fatalf("the edit corrects %q, and the message being edited is %q", correction.MessageID, target)
+	case correction.FromMe:
+		t.Fatalf("somebody else's edit was published as the account's own: %s", emission.Payload)
+	case correction.Content.Type != "text" || correction.Content.Body == "":
+		t.Fatalf("the edit arrived with no new body: %s", emission.Payload)
+	}
+	fmt.Fprintf(os.Stderr, "edit: %s now reads %q\n", correction.MessageID, correction.Content.Body)
+}
+
+// liveCheckTheReactions reads the two halves of putting a reaction on and taking it off.
+// Which arrives first is not assumed: they are told apart by the emoji, because that is
+// what tells them apart on the wire.
+func liveCheckTheReactions(t *testing.T, emissions []*engine.Emission, target string) {
+	t.Helper()
+
+	var put, taken []byte
+	for _, emission := range emissions {
+		var body struct {
+			ID       string `json:"id"`
+			TargetID string `json:"target_id"`
+			Emoji    string `json:"emoji"`
+			FromMe   bool   `json:"from_me"`
+		}
+		if err := json.Unmarshal(emission.Payload, &body); err != nil {
+			t.Fatalf("unmarshal the reaction: %v", err)
+		}
+		if body.TargetID != target {
+			fmt.Fprintf(os.Stderr, "ignoring a reaction on %s\n", body.TargetID)
+			continue
+		}
+		if body.FromMe {
+			t.Fatalf("somebody else's reaction was published as the account's own: %s", emission.Payload)
+		}
+		if body.ID == "" || body.ID == target {
+			// The client deduplicates on the reaction's own id and matches its own sends
+			// by it. The target's id in that field would collide with the message.
+			t.Fatalf("the reaction has no id of its own: %s", emission.Payload)
+		}
+		if body.Emoji == "" {
+			taken = emission.Payload
+		} else {
+			put = emission.Payload
+		}
+	}
+	if put == nil {
+		t.Fatalf("no reaction on %s carried an emoji", target)
+	}
+	if taken == nil {
+		t.Fatalf("taking the reaction back never arrived as an empty emoji, which is how a removal is spelled")
+	}
+}
+
+func liveCheckTheDeletion(t *testing.T, emission *engine.Emission, target string) {
+	t.Helper()
+
+	var deletion struct {
+		MessageID string `json:"message_id"`
+		By        string `json:"by"`
+	}
+	if err := json.Unmarshal(emission.Payload, &deletion); err != nil {
+		t.Fatalf("unmarshal the deletion: %v", err)
+	}
+	if deletion.MessageID != target {
+		t.Fatalf("the deletion names %q, and the message deleted is %q", deletion.MessageID, target)
+	}
+	if deletion.By != "contact" {
+		// `self` is what the client applies to its own deletions, files and all. Saying
+		// it about somebody else's would destroy an attachment nobody asked it to.
+		t.Fatalf("somebody else's deletion was published as by=%q", deletion.By)
+	}
+}
+
+// TestLiveWatchAShare is the rest of the inbound content union against a real phone: a
+// pin on a map, a card out of an address book, and a poll -- which is not a body this
+// build has an arm for and is therefore the check that the placeholder does what it was
+// built for.
+//
+// The poll is the one that could not be reasoned about. It arrives as a creation, and
+// then as a vote, and in a group it drags key material along with it; each of those is a
+// separate decision this slice made about what is a message and what is not, and the
+// only way to know they were made right is to watch one happen. Exactly one bubble is
+// the pass condition, and every extra event this phase saw is printed so a wrong one can
+// be read rather than guessed at.
+//
+// A dropped vote publishes nothing, though, and nothing is also what a vote nobody cast
+// looks like. So a text sent after the vote is what closes the phase: it proves the
+// session was up and delivering across the moment the vote crossed, which turns the
+// silence in between into evidence instead of an absence. Ending on the poll itself
+// would leave no window for the vote to be seen in at all.
+func TestLiveWatchAShare(t *testing.T) {
+	window := liveWindow(t, 5*time.Minute)
+
+	session, _ := liveSession(t)
+	events := watch(t, session)
+
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	events.awaitState(t, "open", 2*time.Minute)
+
+	fmt.Fprintf(os.Stderr,
+		"now, from the other phone, once each and in this order:\n"+
+			"  1. a location\n  2. a contact card\n  3. a new poll, then vote in it\n"+
+			"  4. any text, last of all, which is what closes this phase\n"+
+			"send each of them exactly once: a kind sent twice is indistinguishable from a leak and fails the phase.\n"+
+			"waiting up to %s\n",
+		window)
+
+	seen := map[string]map[string]any{}
+	extra := 0
+	deadline := time.After(window)
+
+collect:
+	for {
+		select {
+		case emission, ok := <-events.seen:
+			if !ok {
+				t.Fatal("the session ended before the phase finished")
+			}
+			if emission.Type != protocol.EventMessageReceived {
+				continue
+			}
+			var body struct {
+				Message struct {
+					ID      string         `json:"id"`
+					FromMe  bool           `json:"from_me"`
+					Content map[string]any `json:"content"`
+				} `json:"message"`
+			}
+			if err := json.Unmarshal(emission.Payload, &body); err != nil {
+				t.Fatalf("unmarshal the message: %v", err)
+			}
+			if body.Message.FromMe {
+				continue
+			}
+			kind, _ := body.Message.Content["type"].(string)
+			if _, already := seen[kind]; already {
+				// A second bubble of a kind this phase already has is the interesting
+				// failure: it is what a vote or a key rotation published as a message
+				// looks like from the outside.
+				extra++
+				fmt.Fprintf(os.Stderr, "a second %s: %s\n", kind, emission.Payload)
+			}
+			seen[kind] = body.Message.Content
+			if len(seen) == 4 {
+				break collect
+			}
+		case <-deadline:
+			break collect
+		}
+	}
+
+	for _, want := range []string{"location", "contacts", "unsupported", "text"} {
+		if _, arrived := seen[want]; !arrived {
+			t.Errorf("no %s arrived within %s; what did: %v", want, window, keysOf(seen))
+		}
+	}
+	if t.Failed() {
+		return
+	}
+
+	pin := seen["location"]
+	if pin["latitude"] == nil || pin["longitude"] == nil {
+		t.Errorf("the pin arrived without coordinates: %v", pin)
+	}
+	fmt.Fprintf(os.Stderr, "pin: %v\n", pin)
+
+	cards, _ := seen["contacts"]["contacts"].([]any)
+	if len(cards) == 0 {
+		t.Errorf("the share arrived with no cards: %v", seen["contacts"])
+	} else {
+		card, _ := cards[0].(map[string]any)
+		if card["display_name"] == nil || card["display_name"] == "" {
+			// Read off the card when WhatsApp does not put it beside one, which is the
+			// half no fixture could have said was needed.
+			t.Errorf("the card arrived with no name: %v", card)
+		}
+		if card["phone"] == nil || card["phone"] == "" {
+			t.Errorf("the card arrived with no number: %v", card)
+		}
+		fmt.Fprintf(os.Stderr, "card: %v\n", card)
+	}
+
+	if reason := seen["unsupported"]["reason"]; reason != "unknown_type" {
+		t.Errorf("the poll was called %v, and it is a body with no arm rather than an empty one", reason)
+	}
+	if extra > 0 {
+		// The whole point of the machinery filter. A vote, a key rotation or a result
+		// snapshot published as a message received is a bubble an agent cannot read, at
+		// the rate people vote.
+		//
+		// Nothing here can tell that apart from the same kind sent twice by hand, so the
+		// extras are printed above with their ids: read them against the phone before
+		// believing the filter leaked. Narrowing this to the placeholder kind would be
+		// the tempting fix and the wrong one -- a live location update has a renderer,
+		// so the flooding case this counter exists for arrives as a second `location`.
+		t.Errorf("%d event(s) arrived that should not have been messages at all", extra)
+	}
+	if state := session.state(); state != "open" {
+		t.Fatalf("the session did not stay up: state=%s", state)
+	}
+}
+
+func keysOf(seen map[string]map[string]any) []string {
+	kinds := make([]string, 0, len(seen))
+	for kind := range seen {
+		kinds = append(kinds, kind)
+	}
+	sort.Strings(kinds)
+	return kinds
+}
+
+// TestLiveMedia is the media half of TestLiveListen, and the only check that walks the
+// whole path end to end: WhatsApp encrypts a file, whatsmeow fetches and decrypts it,
+// the store keeps it, the event says where to fetch it, and the endpoint hands it back
+// over HTTP against a bearer token. Every step of that has a unit test and none of them
+// had ever run against a file somebody really sent.
+//
+// The endpoint is served here on a throwaway port and the reference is published under
+// it, which is what makes the URL on the event the URL that is actually fetched: a
+// reference nobody dials proves nothing about whether it could be dialled.
+func TestLiveMedia(t *testing.T) {
+	const token = "live-check"
+
+	root := filepath.Join(liveDir(t), "blobs")
+	blobs, err := media.New(media.Options{Root: root})
+	if err != nil {
+		t.Fatalf("open the blob store at %s: %v", root, err)
+	}
+	t.Cleanup(func() {
+		if err := blobs.Close(); err != nil {
+			t.Errorf("close the blob store: %v", err)
+		}
+	})
+	t.Logf("blobs: %s", root)
+
+	// Started before the session, because the engine refuses a store it has no address
+	// to publish under and the address is this server's.
+	mux := http.NewServeMux()
+	mux.Handle("GET /media/{id}", media.Handler(media.HandlerOptions{Blobs: blobs, Token: token}))
+	endpoint := httptest.NewServer(mux)
+	t.Cleanup(endpoint.Close)
+
+	session, _ := liveSessionWith(t, MediaOptions{Blobs: blobs, BaseURL: endpoint.URL})
+	events := watch(t, session)
+
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	events.awaitState(t, "open", 2*time.Minute)
+
+	window := liveWindow(t, 3*time.Minute)
+	// One file proves the path; several prove the translation, and each kind is the only
+	// one that carries something: a document has the filename, a voice note the flag and
+	// the duration, a sticker the PNG preview where every other kind has a JPEG one.
+	wanted := liveCount(t)
+	say("send %d file(s) to the paired number now — photo, video, VOICE NOTE, DOCUMENT, STICKER; waiting up to %s",
+		wanted, window)
+
+	seen := map[protocol.MediaKind]int{}
+	deadline := time.Now().Add(window)
+	for i := 1; i <= wanted; i++ {
+		left := time.Until(deadline)
+		if left <= 0 {
+			t.Fatalf("only %d of %d files arrived before the window closed", i-1, wanted)
+		}
+		_, content := oneLiveFile(t, events, endpoint.URL, token, left)
+		seen[content.Kind]++
+		say("%d/%d done", i, wanted)
+	}
+	say("kinds that arrived: %v", seen)
+
+	if state := session.state(); state != "open" {
+		t.Fatalf("the session did not stay up: state=%s", state)
+	}
+}
+
+// oneLiveFile waits for one media message, checks what the contract says about it, and
+// fetches the bytes from the URL the event carried. The id comes back with the content
+// because a message is asked about again by name.
+func oneLiveFile(t *testing.T, events *recorder, base, token string, within time.Duration) (string, protocol.MediaContent) {
+	t.Helper()
+
+	received := events.await(t, protocol.EventMessageReceived, within)
+	var body struct {
+		Message struct {
+			ID      string                `json:"id"`
+			Content protocol.MediaContent `json:"content"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(received.Payload, &body); err != nil {
+		t.Fatalf("unmarshal the message: %v", err)
+	}
+	content := body.Message.Content
+	if content.Type != "media" {
+		t.Fatalf("that was not a media message (%s). Send a file rather than a text.", content.Type)
+	}
+	if content.Ref == nil {
+		t.Fatalf("the message arrived with nothing to fetch: %s", received.Payload)
+	}
+	say("got a %s: mime=%q filename=%q size=%d duration=%d voice_note=%v thumbnail=%dB",
+		content.Kind, content.Mime, content.Filename, content.Size, content.Duration,
+		content.VoiceNote, len(content.Thumbnail))
+
+	ref := content.Ref
+	if ref.Kind != protocol.MediaRefConnectorBlob || ref.ID == "" || ref.URL == "" || ref.SHA256 == "" {
+		t.Fatalf("the reference does not describe a blob on this instance: %+v", ref)
+	}
+	if want := base + "/media/" + ref.ID; ref.URL != want {
+		t.Fatalf("the reference points at %q, want %q", ref.URL, want)
+	}
+
+	// The whole point of the phase: fetch what the client would fetch, from the URL the
+	// event carried, with the token the registry publishes.
+	fetched := fetchBlob(t, ref.URL, token)
+	if fetched.status != http.StatusOK {
+		t.Fatalf("fetching the blob answered %d: %s", fetched.status, fetched.body)
+	}
+	if int64(len(fetched.body)) != ref.Size {
+		t.Fatalf("the blob is %d bytes and the reference says %d", len(fetched.body), ref.Size)
+	}
+	if digest := fmt.Sprintf("%x", sha256.Sum256(fetched.body)); digest != ref.SHA256 {
+		t.Fatalf("the bytes hash to %s and the reference says %s", digest, ref.SHA256)
+	}
+	if content.Mime != "" && fetched.mime != content.Mime {
+		t.Fatalf("the endpoint served %q and the message said %q", fetched.mime, content.Mime)
+	}
+	say("fetched %d bytes from %s, digest matches", len(fetched.body), ref.URL)
+
+	// And the other half of the endpoint: what guards a URL that hands out somebody's
+	// file is the token, and nothing else.
+	if refused := fetchBlob(t, ref.URL, ""); refused.status != http.StatusUnauthorized {
+		t.Fatalf("fetching without the token answered %d, want 401", refused.status)
+	}
+	return body.Message.ID, content
+}
+
+// liveCount is how many files this phase waits for.
+func liveCount(t *testing.T) int {
+	t.Helper()
+
+	raw := os.Getenv("WAC_LIVE_FILES")
+	if raw == "" {
+		return 1
+	}
+	count, err := strconv.Atoi(raw)
+	if err != nil || count < 1 {
+		t.Fatalf("WAC_LIVE_FILES=%q: want a positive count", raw)
+	}
+	return count
+}
+
+// TestLiveRefetch is M2.2c against the real CDN. A blob is instance-local and
+// time-bounded, so the address published with a message stops working, and what has to
+// hold is that the coordinates filed with it are still enough to fetch the same file
+// again minutes or days later. A fake downloader cannot answer that: whether a
+// `directPath` outlives its blob, and whether the key kept with it still decrypts what
+// comes back, is WhatsApp's answer to give.
+//
+// Run it with no file in hand and it asks for one. Run it with WAC_LIVE_REFETCH_ID set
+// to a message a previous run filed, and it fetches that one instead, which is the same
+// check across a real restart rather than across a sweep.
+func TestLiveRefetch(t *testing.T) {
+	const token = "live-check"
+
+	// This phase's own root, thrown away with it: the file not being cached is the
+	// premise, and a root shared with the media phase would start out holding it.
+	root := t.TempDir()
+
+	// The sweep reads the clock through the store, so the phase moves the clock instead
+	// of waiting a TTL out. A TTL short enough to expire on its own would be racing the
+	// download of the very message being set up.
+	var ahead atomic.Int64
+	blobs, err := media.New(media.Options{
+		Root: root,
+		TTL:  5 * time.Minute,
+		Now:  func() time.Time { return time.Now().Add(time.Duration(ahead.Load())) },
+	})
+	if err != nil {
+		t.Fatalf("open the blob store at %s: %v", root, err)
+	}
+	t.Cleanup(func() {
+		if err := blobs.Close(); err != nil {
+			t.Errorf("close the blob store: %v", err)
+		}
+	})
+
+	mux := http.NewServeMux()
+	mux.Handle("GET /media/{id}", media.Handler(media.HandlerOptions{Blobs: blobs, Token: token}))
+	endpoint := httptest.NewServer(mux)
+	t.Cleanup(endpoint.Close)
+
+	session, container := liveSessionWith(t, MediaOptions{Blobs: blobs, BaseURL: endpoint.URL})
+	events := watch(t, session)
+
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	events.awaitState(t, "open", 2*time.Minute)
+
+	// gone is the reference the message was published with, and it is only known when
+	// this run is the one that received it.
+	messageID, gone := os.Getenv("WAC_LIVE_REFETCH_ID"), protocol.MediaRef{}
+	if messageID == "" {
+		window := liveWindow(t, 3*time.Minute)
+		say("send ONE file to the paired number now; waiting up to %s", window)
+
+		var content protocol.MediaContent
+		messageID, content = oneLiveFile(t, events, endpoint.URL, token, window)
+		gone = *content.Ref
+		say("message %s — pass it as WAC_LIVE_REFETCH_ID on a later run to check the same thing across a restart", messageID)
+
+		// The premise, made true the way production makes it true: the blob ages out
+		// and the sweep collects it.
+		ahead.Store(int64(10 * time.Minute))
+		dropped, freed, err := blobs.Sweep(t.Context())
+		ahead.Store(0)
+		if err != nil {
+			t.Fatalf("sweep the blob store: %v", err)
+		}
+		if dropped == 0 {
+			t.Fatal("the sweep collected nothing, so the file this phase is about is still cached and nothing below would be proven")
+		}
+		say("swept %d blob(s), %d bytes freed", dropped, freed)
+
+		if still := fetchBlob(t, gone.URL, token); still.status != http.StatusNotFound {
+			t.Fatalf("the address published with the message still answers %d, want 404", still.status)
+		}
+	}
+
+	// What makes the refetch possible at all is a row, not a file. Reading it here says
+	// which of the two is missing when the command below fails.
+	kept, found, err := container.For(liveSID).MediaPart(t.Context(), messageID)
+	if err != nil {
+		t.Fatalf("read what was filed for %s: %v", messageID, err)
+	}
+	if !found {
+		t.Fatalf("nothing was filed for %s, so there is nothing to fetch again", messageID)
+	}
+	say("filed: kind=%s mime=%q filename=%q size=%d", kept.Kind, kept.Mime, kept.Filename, kept.FileLength)
+
+	again := refetch(t, session, messageID, nil)
+	if again.Kind != protocol.MediaRefConnectorBlob {
+		t.Fatalf("the refetch answered a %q reference, want the blob it just wrote", again.Kind)
+	}
+	if want := endpoint.URL + "/media/" + again.ID; again.URL != want {
+		t.Fatalf("the refetch published under %q, want %q", again.URL, want)
+	}
+	if gone.ID != "" {
+		if again.ID == gone.ID {
+			t.Fatal("the refetch handed back the blob that was swept")
+		}
+		if again.Size != gone.Size || again.SHA256 != gone.SHA256 {
+			t.Fatalf("the refetch served %d bytes (%s), want the same file as %d (%s)",
+				again.Size, again.SHA256, gone.Size, gone.SHA256)
+		}
+	}
+
+	// The whole point: these bytes came from WhatsApp just now, on coordinates that
+	// outlived the file they were filed with.
+	fetched := fetchBlob(t, again.URL, token)
+	if fetched.status != http.StatusOK {
+		t.Fatalf("fetching the refetched blob answered %d: %s", fetched.status, fetched.body)
+	}
+	if int64(len(fetched.body)) != again.Size {
+		t.Fatalf("the blob is %d bytes and the reference says %d", len(fetched.body), again.Size)
+	}
+	if digest := fmt.Sprintf("%x", sha256.Sum256(fetched.body)); digest != again.SHA256 {
+		t.Fatalf("the bytes hash to %s and the reference says %s", digest, again.SHA256)
+	}
+	say("fetched %d bytes from %s, digest matches", len(fetched.body), again.URL)
+
+	// Asking twice is what a redelivered command does, and issue #24 is that it used to
+	// be answered by paying for the file a second time. Both halves are checked, because
+	// either alone is satisfiable by something that is not the fix: the same id would
+	// come back from an answer that reads the row without asking this instance's own
+	// store, which is a reference to a file on somebody else's disk, and a download that
+	// is not spent proves nothing about what is being served.
+	blobsBefore, bytesBefore := countBlobs(t, root)
+	twice := refetch(t, session, messageID, nil)
+	if twice.ID != again.ID {
+		t.Fatalf("two refetches named %s and %s, and the file was already on this disk", again.ID, twice.ID)
+	}
+	if twice.SHA256 != again.SHA256 {
+		t.Fatalf("the second refetch served %s and the first served %s", twice.SHA256, again.SHA256)
+	}
+	if blobsAfter, bytesAfter := countBlobs(t, root); blobsAfter != blobsBefore || bytesAfter != bytesBefore {
+		t.Fatalf("the second refetch took the store from %d blobs and %d bytes to %d and %d, "+
+			"so it downloaded the file again", blobsBefore, bytesBefore, blobsAfter, bytesAfter)
+	}
+	repeat := fetchBlob(t, twice.URL, token)
+	if repeat.status != http.StatusOK {
+		t.Fatalf("fetching the second refetch answered %d: %s", repeat.status, repeat.body)
+	}
+	if digest := fmt.Sprintf("%x", sha256.Sum256(repeat.body)); digest != twice.SHA256 {
+		t.Fatalf("the reused blob serves bytes hashing to %s and the reference says %s", digest, twice.SHA256)
+	}
+	if twice.ExpiresAt <= time.Now().UnixMilli() {
+		t.Fatalf("the second refetch answered a reference that lapsed at %d, and it is %d",
+			twice.ExpiresAt, time.Now().UnixMilli())
+	}
+	say("the second refetch reused %s: no download, %d bytes served, expires at %d",
+		twice.ID, len(repeat.body), twice.ExpiresAt)
+
+	if state := session.state(); state != "open" {
+		t.Fatalf("the session did not stay up: state=%s", state)
+	}
+}
+
+// TestLiveViewOnce is the decision this build makes about a file sent to be seen once:
+// the message goes out, the file is not kept, and the preview does not travel either.
+//
+// It often does not get that far, and finding out is what it was written for. In the run
+// that found #20, what arrived from a phone was a stub with no ciphertext (`Unavailable
+// message ... type: "view_once"`), which whatsmeow acknowledges while asking the primary
+// phone to send the real one over, and the phone never answered.
+//
+// Which is about the sender rather than about companions, and this comment used to say
+// otherwise. `TestLiveViewOnceReachesACompanion` sends the same three shapes from the
+// second paired account, downloads what arrives and compares it with what was sent, and
+// the bytes are there every time -- so nothing between here and WhatsApp's servers strips
+// a view-once from a companion device. What is still unmeasured is the arm this phase
+// covers: whether an official client fans a view-once out to the recipient's companions at
+// all, or only to their phone. That one needs hardware, which is why this phase still asks
+// for a person. (Its name is why the command above anchors with `$`: `-run` is an
+// unanchored regex, and without the anchor asking for this phase also starts that one,
+// which wants the second account paired.)
+//
+// Both endings are checked, because both are correct and which one happens is not this
+// build's to decide. If the message arrives, its file is refused and the reason is beside
+// it. If only a stub does, what arrives is the message with no body at all, which is what
+// an agent now sees instead of silence.
+func TestLiveViewOnce(t *testing.T) {
+	const token = "live-check"
+
+	root := filepath.Join(liveDir(t), "blobs")
+	blobs, err := media.New(media.Options{Root: root})
+	if err != nil {
+		t.Fatalf("open the blob store at %s: %v", root, err)
+	}
+	t.Cleanup(func() { _ = blobs.Close() })
+
+	mux := http.NewServeMux()
+	mux.Handle("GET /media/{id}", media.Handler(media.HandlerOptions{Blobs: blobs, Token: token}))
+	endpoint := httptest.NewServer(mux)
+	t.Cleanup(endpoint.Close)
+
+	session, _ := liveSessionWith(t, MediaOptions{Blobs: blobs, BaseURL: endpoint.URL})
+	events := watch(t, session)
+
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	events.awaitState(t, "open", 2*time.Minute)
+
+	window := liveWindow(t, 3*time.Minute)
+	say("send a VIEW ONCE photo or video to the paired number now; waiting up to %s", window)
+	received := events.await(t, protocol.EventMessageReceived, window)
+
+	var body struct {
+		Message struct {
+			ID      string          `json:"id"`
+			Content json.RawMessage `json:"content"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(received.Payload, &body); err != nil {
+		t.Fatalf("unmarshal the message: %v", err)
+	}
+	var said struct {
+		Type   string `json:"type"`
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal(body.Message.Content, &said); err != nil {
+		t.Fatalf("unmarshal the content: %v", err)
+	}
+	if said.Type == "unsupported" {
+		// The ordinary ending: the phone did not forward it, so what the account was
+		// given is a stanza with nothing in it. The bubble says so, which is the whole of
+		// #20 -- before it, an agent saw nothing at all.
+		if said.Reason != string(protocol.UnsupportedUnavailable) {
+			t.Fatalf("the message says %q, and what arrived was a stanza carrying nothing", said.Reason)
+		}
+		say("the phone did not forward the view-once message, and the bubble says a message is there")
+		return
+	}
+	var content protocol.MediaContent
+	if err := json.Unmarshal(body.Message.Content, &content); err != nil {
+		t.Fatalf("unmarshal the media content: %v", err)
+	}
+	if content.Type != "media" {
+		t.Fatalf("that was neither a media message nor an unreadable one (%s). Send a view-once photo.", content.Type)
+	}
+	if content.Ref != nil {
+		t.Fatalf("a view-once file was kept and handed out as %+v", content.Ref)
+	}
+	if content.Thumbnail != "" {
+		t.Fatalf("a view-once message carried a %d-byte preview of what was not kept", len(content.Thumbnail))
+	}
+
+	// Published after the message and never instead of it, which is what lets the client
+	// find the message it belongs to.
+	failure := events.await(t, protocol.EventMediaDownloadFailed, 30*time.Second)
+	var why protocol.MediaDownloadFailure
+	if err := json.Unmarshal(failure.Payload, &why); err != nil {
+		t.Fatalf("unmarshal the failure: %v", err)
+	}
+	if why.MessageID != body.Message.ID || why.Reason != reasonViewOnce {
+		t.Fatalf("the failure is %+v, want %s for %s", why, reasonViewOnce, body.Message.ID)
+	}
+	say("a view-once %s arrived, nothing was kept, and the client was told why", content.Kind)
+}
+
+// fetched is one answer from the media endpoint.
+type fetched struct {
+	status int
+	mime   string
+	// disposition is what the handler tells a browser to call the file. Kept because a
+	// blob served twice has to be described the same way twice, and the description is
+	// read off the file beside the blob rather than off the request.
+	disposition string
+	body        []byte
+}
+
+// fetchBlob asks the endpoint for a blob the way the client does. An empty token sends
+// no header at all, which is the unauthenticated case rather than a wrong one.
+func fetchBlob(t *testing.T, url, token string) fetched {
+	t.Helper()
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, url, http.NoBody)
+	if err != nil {
+		t.Fatalf("build the request: %v", err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	answer, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("fetch %s: %v", url, err)
+	}
+	defer func() { _ = answer.Body.Close() }()
+
+	read, err := io.ReadAll(answer.Body)
+	if err != nil {
+		t.Fatalf("read the blob: %v", err)
+	}
+	return fetched{
+		status: answer.StatusCode, mime: answer.Header.Get("Content-Type"),
+		disposition: answer.Header.Get("Content-Disposition"), body: read,
+	}
+}
+
+// liveWindow is how long a phase waits for a human to send something.
+func liveWindow(t *testing.T, fallback time.Duration) time.Duration {
+	t.Helper()
+
+	raw := os.Getenv("WAC_LIVE_SECONDS")
+	if raw == "" {
+		return fallback
+	}
+	seconds, err := strconv.Atoi(raw)
+	if err != nil {
+		t.Fatalf("WAC_LIVE_SECONDS=%q: %v", raw, err)
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+// TestLiveSend sends a text from the paired account, which is the half no fake can
+// check: what a unit test can prove is that the request was built and refused
+// correctly, and what only WhatsApp can answer is whether it took the message.
+//
+// Send twice with the same WAC_LIVE_MESSAGE_ID to see the idempotency for yourself. The
+// caller names the message, so both sends go out under one id and the recipient's own
+// client shows one message. That last part is on the phone, not in here.
+func TestLiveSend(t *testing.T) {
+	to := os.Getenv("WAC_LIVE_TO")
+	if to == "" {
+		t.Skip("set WAC_LIVE_TO to the number this account should send to")
+	}
+
+	session, _ := liveSession(t)
+	events := watch(t, session)
+
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	events.awaitState(t, "open", 2*time.Minute)
+
+	messageID := os.Getenv("WAC_LIVE_MESSAGE_ID")
+	if messageID == "" {
+		messageID = session.current().GenerateMessageID()
+	}
+	body := map[string]any{
+		"message_id": messageID,
+		"to":         map[string]any{"kind": "phone", "id": to},
+		"content":    map[string]any{"type": "text", "body": "conector nativo, fatia de envio"},
+	}
+	if quoted := os.Getenv("WAC_LIVE_QUOTE"); quoted != "" {
+		// The half no unit test can answer: the quote goes out as a stanza id and a
+		// participant, with no copy of the message it answers, because the caller does
+		// not send one and this connector keeps no messages. Whether the recipient's
+		// client renders it from the id alone is a question for a phone.
+		body["quoted"] = map[string]any{"id": quoted, "from_me": false}
+		body["content"] = map[string]any{"type": "text", "body": "conector nativo, em resposta a mensagem acima"}
+	}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("build the send: %v", err)
+	}
+
+	result, err := session.Execute(t.Context(), &protocol.Command{
+		Type: protocol.CommandMessageSend, Payload: payload,
+	})
+	if err != nil {
+		t.Fatalf("message.send: %v", err)
+	}
+
+	var sent struct {
+		MessageID string `json:"message_id"`
+		Timestamp int64  `json:"timestamp"`
+	}
+	if err := json.Unmarshal(result, &sent); err != nil {
+		t.Fatalf("unmarshal the result: %v", err)
+	}
+	if sent.MessageID != messageID {
+		t.Fatalf("the send came back as %q, and the caller named it %q", sent.MessageID, messageID)
+	}
+	if sent.Timestamp == 0 {
+		t.Fatal("the send came back without the timestamp WhatsApp stamped it with")
+	}
+	fmt.Fprintf(os.Stderr, "sent %s at %s\n", sent.MessageID, time.UnixMilli(sent.Timestamp))
+}
+
+// TestLiveActOnAMessage is M2.5's outbound half against a real recipient: a message
+// corrected, one reacted to, and one deleted.
+//
+// This is the phase the unit tests cannot stand in for, and the reason is the same for
+// all three. Each names a message that already exists with a key, and WhatsApp accepts a
+// key that resolves to nothing exactly as readily as one that resolves: the send answers
+// with a timestamp either way, and nothing afterwards says which happened. A test on this
+// side can check that the key was built from the right parts. Only a recipient's client
+// can say whether the parts were the right ones.
+//
+// Two messages are sent rather than one, so everything is on screen at the end. The first
+// is corrected and reacted to and stays; the second is deleted. A single message would
+// leave the earlier steps invisible behind the deletion.
+func TestLiveActOnAMessage(t *testing.T) {
+	to := os.Getenv("WAC_LIVE_TO")
+	if to == "" {
+		t.Skip("set WAC_LIVE_TO to the number this account should send to")
+	}
+
+	session, _ := liveSession(t)
+	events := watch(t, session)
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	events.awaitState(t, "open", 2*time.Minute)
+
+	chat := map[string]any{"kind": "phone", "id": to}
+	standing := liveSendOne(t, session, to, map[string]any{
+		"type": "text", "body": "conector nativo: esta mensagem vai ser corrigida",
+	})
+	doomed := liveSendOne(t, session, to, map[string]any{
+		"type": "text", "body": "conector nativo: esta mensagem vai ser apagada",
+	})
+
+	liveActOne(t, session, protocol.CommandMessageEdit, map[string]any{
+		"to": chat, "target_id": standing,
+		"content": map[string]any{"type": "text", "body": "conector nativo: corrigida"},
+	})
+	// On the account's own message, which is the only kind of target this phase has: the
+	// other branch, a reaction on the contact's message, needs an id from their side and
+	// is what WAC_LIVE_REACT_TO is for.
+	liveActOne(t, session, protocol.CommandMessageReact, map[string]any{
+		"to": chat, "target_id": standing, "target_from_me": true, "emoji": "❤️",
+	})
+	liveActOne(t, session, protocol.CommandMessageRevoke, map[string]any{
+		"to": chat, "target_id": doomed,
+	})
+
+	// A reaction on somebody else's message builds a different key -- `from_me` false,
+	// and in a direct chat no participant -- and a key that is wrong there fails the same
+	// silent way. Set WAC_LIVE_REACT_TO to an id the recipient sent, or to `wait` to have
+	// the phase take the next message they send: an id copied by hand is an id nobody
+	// copies, and the branch then never runs.
+	if theirs := os.Getenv("WAC_LIVE_REACT_TO"); theirs != "" {
+		// Reacted in the chat the message arrived in, which is not always the one this
+		// phase sends to: the key carries the chat as its `remoteJID`, and a direct chat
+		// this account addresses by phone can deliver under a LID chat. Reacting to the
+		// phone chat then names a message that chat does not hold. An id given by hand
+		// has no event to take a chat from and falls back to the one being sent to,
+		// which is the reason `wait` is the better way to run this.
+		where := chat
+		if theirs == "wait" {
+			theirs, where = liveAwaitTheirMessage(t, events, liveWindow(t, 2*time.Minute))
+		}
+		emoji := "👍"
+		if pick := os.Getenv("WAC_LIVE_REACT_EMOJI"); pick != "" {
+			// A reaction replaces the sender's previous one, so telling a second run
+			// apart from the first needs a different one.
+			emoji = pick
+		}
+		liveActOne(t, session, protocol.CommandMessageReact, map[string]any{
+			"to": where, "target_id": theirs, "emoji": emoji,
+		})
+	}
+	// And taking one off is a reaction with an empty emoji, not a command of its own.
+	reaction := "carries the reaction"
+	if os.Getenv("WAC_LIVE_UNREACT") != "" {
+		liveActOne(t, session, protocol.CommandMessageReact, map[string]any{
+			"to": chat, "target_id": standing, "target_from_me": true, "emoji": "",
+		})
+		reaction = "carries no reaction, the one put on it having been taken off"
+	}
+
+	fmt.Fprintf(os.Stderr, "check the recipient: %s reads \"corrigida\", %s, "+
+		"and says it was edited; %s is gone\n", standing, reaction, doomed)
+}
+
+// liveAwaitTheirMessage is the next message the recipient sends: its id, and the chat it
+// arrived in. Both, because the chat is half of the key and is not always the one this
+// phase addresses -- see the caller.
+//
+// Waiting rather than taking an id by hand is what makes this branch get run at all: an
+// id somebody has to copy off a phone is an id nobody copies.
+func liveAwaitTheirMessage(
+	t *testing.T, events *recorder, window time.Duration,
+) (id string, chat map[string]any) {
+	t.Helper()
+
+	fmt.Fprintf(os.Stderr, "send a text from the recipient's phone now; waiting up to %s\n", window)
+	received := events.await(t, protocol.EventMessageReceived, window)
+	var body struct {
+		Message struct {
+			ID     string `json:"id"`
+			FromMe bool   `json:"from_me"`
+			Chat   struct {
+				Kind string `json:"kind"`
+				ID   string `json:"id"`
+			} `json:"chat"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(received.Payload, &body); err != nil {
+		t.Fatalf("unmarshal the message: %v", err)
+	}
+	if body.Message.ID == "" || body.Message.Chat.ID == "" || body.Message.FromMe {
+		// An echo of this account's own send would build the other key entirely, which
+		// is the one the rest of the phase already covers.
+		t.Fatalf("that is not a message from the other side: %s", received.Payload)
+	}
+	return body.Message.ID, map[string]any{"kind": body.Message.Chat.Kind, "id": body.Message.Chat.ID}
+}
+
+// liveActOne runs one of the three commands that act on an existing message and fails on
+// anything but a clean answer. What it cannot check is the part that matters, which is
+// why it prints and the phase ends with a look at the phone.
+func liveActOne(t *testing.T, session *Session, kind protocol.CommandType, payload map[string]any) {
+	t.Helper()
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("build the %s: %v", kind, err)
+	}
+	// The command id is what the stanza id is derived from when the payload names none,
+	// so two actions sharing one go out under the same id and the recipient discards the
+	// second as a duplicate of the first. That is the mechanism working, and in here it
+	// would read as the action silently failing.
+	//
+	// Taken from the payload rather than from a field picked out of it, because picking
+	// has to be redone every time the phase grows an action: the type and the target were
+	// enough until a reaction and its removal, which differ only in the emoji. Two
+	// identical payloads are the same command and should collide; anything else is a
+	// different one.
+	result, err := session.Execute(t.Context(), &protocol.Command{
+		Type: kind, ID: fmt.Sprintf("live-%s-%x", kind, sha256.Sum256(body)), Payload: body,
+	})
+	if err != nil {
+		t.Fatalf("%s: %v", kind, err)
+	}
+	fmt.Fprintf(os.Stderr, "%s on %v answered %s\n", kind, payload["target_id"], result)
+}
+
+// TestLiveLogout unlinks the device. It is the last phase, and running it means the
+// next run starts at TestLivePairWithQR again.
+// TestLiveSendMedia is M2.4 against a real recipient: a file fetched over HTTP, uploaded
+// to WhatsApp, and rendered in somebody's chat.
+//
+// A fake upload proves the plumbing and nothing else. What only WhatsApp and a recipient
+// client can answer is whether the key this build derives decrypts on the other side,
+// whether the mimetype it sends is one the client renders rather than files as an
+// attachment, and whether a sticker uploaded under the image key arrives as a sticker.
+// Every one of those fails as something the recipient sees and the sender does not.
+//
+// The file is served from this process, so the fetch is a real HTTP round trip against a
+// real address, headers included. Point WAC_LIVE_FILE at a file to send your own.
+func TestLiveSendMedia(t *testing.T) {
+	to := os.Getenv("WAC_LIVE_TO")
+	if to == "" {
+		t.Skip("set WAC_LIVE_TO to the number this account should send to")
+	}
+	const token = "live-check"
+
+	file, name, kind := liveFileToSend(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /outbound/{name}", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			// Asserted by serving a 401: the send then fails with the reason, which is
+			// how this phase would report a header that did not travel.
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", liveMime(name))
+		w.Header().Set("Content-Length", strconv.Itoa(len(file)))
+		_, _ = w.Write(file)
+	})
+	endpoint := httptest.NewServer(mux)
+	t.Cleanup(endpoint.Close)
+
+	session, _ := liveSession(t)
+	events := watch(t, session)
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	events.awaitState(t, "open", 2*time.Minute)
+
+	// A voice note is not something a filename can say: an .ogg is as likely to be music,
+	// and what makes one is the caller setting the flag. It is worth its own run because
+	// it is the one kind whose type this build fills in on its own.
+	if os.Getenv("WAC_LIVE_VOICE") != "" {
+		kind = "audio"
+	}
+	content := map[string]any{
+		"type": "media", "kind": kind, "filename": name, "size": len(file),
+		"voice_note": os.Getenv("WAC_LIVE_VOICE") != "",
+		"ref": map[string]any{
+			"kind": "url", "url": endpoint.URL + "/outbound/" + name,
+			"headers": map[string]any{"Authorization": "Bearer " + token},
+		},
+	}
+	// Only where WhatsApp has somewhere to put one. A caption on an audio or a sticker is
+	// refused on the payload, so a phase that added one to everything would fail before
+	// fetching anything and never exercise the file at all.
+	if captions[protocol.MediaKind(kind)] {
+		content["caption"] = "conector nativo, fatia de saída"
+	}
+	// WAC_LIVE_DURATION is how long the caller says an audio or a video runs. Worth being
+	// able to leave off as well as set: what a recipient does with a length it was not
+	// given is a question for a phone.
+	// WAC_LIVE_MIME pins what the message says the file is, for telling a type WhatsApp
+	// refuses apart from one it merely renders differently.
+	if forced := os.Getenv("WAC_LIVE_MIME"); forced != "" {
+		content["mime"] = forced
+	}
+	if raw := os.Getenv("WAC_LIVE_DURATION"); raw != "" {
+		seconds, err := strconv.Atoi(raw)
+		if err != nil || seconds < 0 {
+			t.Fatalf("WAC_LIVE_DURATION=%q: want a duration in seconds", raw)
+		}
+		content["duration"] = seconds
+	}
+	sent := liveSendOne(t, session, to, content)
+	say("sent a %s (%d bytes) as %s -- check the recipient renders it, not just receives it", kind, len(file), sent)
+}
+
+// TestLiveSendLocation and TestLiveSendContacts are the two bodies that carry no file.
+// They are here for the same reason as the media phase: what they render as on the other
+// side is not something a protobuf comparison can answer.
+func TestLiveSendLocation(t *testing.T) {
+	to := os.Getenv("WAC_LIVE_TO")
+	if to == "" {
+		t.Skip("set WAC_LIVE_TO to the number this account should send to")
+	}
+
+	session, _ := liveSession(t)
+	events := watch(t, session)
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	events.awaitState(t, "open", 2*time.Minute)
+
+	sent := liveSendOne(t, session, to, map[string]any{
+		"type": "location", "latitude": -25.4284, "longitude": -49.2733,
+		"name": "Praça Tiradentes", "address": "Curitiba, PR",
+	})
+	say("sent a pin as %s -- check it shows the name and the address, not two numbers", sent)
+}
+
+func TestLiveSendContacts(t *testing.T) {
+	to := os.Getenv("WAC_LIVE_TO")
+	if to == "" {
+		t.Skip("set WAC_LIVE_TO to the number this account should send to")
+	}
+
+	session, _ := liveSession(t)
+	events := watch(t, session)
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	events.awaitState(t, "open", 2*time.Minute)
+
+	// A name with a semicolon in it on purpose: a vCard reads one as structure, and the
+	// escaping this build does is only ever confirmed by a recipient rendering the name
+	// in one piece.
+	one := liveSendOne(t, session, to, map[string]any{
+		"type": "contacts",
+		"contacts": []map[string]any{
+			{"display_name": "Souza; Ana", "phone": to},
+		},
+	})
+	say("sent one card as %s -- check the name reads as one line and tapping it opens a chat", one)
+
+	several := liveSendOne(t, session, to, map[string]any{
+		"type": "contacts",
+		"contacts": []map[string]any{
+			{"display_name": "Souza; Ana", "phone": to},
+			{"display_name": "Bruno", "phone": to},
+		},
+	})
+	say("sent two cards as %s -- check they arrive as a stack rather than as one card", several)
+}
+
+// liveSendOne sends one body and answers the id WhatsApp stamped it with.
+func liveSendOne(t *testing.T, session *Session, to string, content map[string]any) string {
+	t.Helper()
+
+	messageID := session.current().GenerateMessageID()
+	payload, err := json.Marshal(map[string]any{
+		"message_id": messageID,
+		"to":         map[string]any{"kind": "phone", "id": to},
+		"content":    content,
+	})
+	if err != nil {
+		t.Fatalf("build the send: %v", err)
+	}
+
+	result, err := session.Execute(t.Context(), &protocol.Command{
+		Type: protocol.CommandMessageSend, Payload: payload,
+	})
+	if err != nil {
+		t.Fatalf("message.send: %v", err)
+	}
+	var sent struct {
+		MessageID string `json:"message_id"`
+		Timestamp int64  `json:"timestamp"`
+	}
+	if err := json.Unmarshal(result, &sent); err != nil {
+		t.Fatalf("unmarshal the result: %v", err)
+	}
+	if sent.MessageID != messageID {
+		t.Fatalf("the send came back as %q, and the caller named it %q", sent.MessageID, messageID)
+	}
+	if sent.Timestamp == 0 {
+		t.Fatal("the send came back without the timestamp WhatsApp stamped it with")
+	}
+	return sent.MessageID
+}
+
+// liveFileToSend is what the media phase sends: the operator's own file when WAC_LIVE_FILE
+// names one, and a small generated JPEG otherwise, so the phase runs with nothing set up.
+func liveFileToSend(t *testing.T) (content []byte, name, kind string) {
+	t.Helper()
+
+	if path := os.Getenv("WAC_LIVE_FILE"); path != "" {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		name = filepath.Base(path)
+		return raw, name, liveKind(name)
+	}
+	// A one-pixel JPEG, so the phase has something real to upload with nothing prepared.
+	// Small on purpose: what is being checked is the round trip, not the transfer.
+	raw, err := base64.StdEncoding.DecodeString(
+		"/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0a" +
+			"HBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAABAAEBAREA/8QAFAABAAAAAAAA" +
+			"AAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AKp//2Q==")
+	if err != nil {
+		t.Fatalf("decode the built-in file: %v", err)
+	}
+	return raw, "pixel.jpg", "image"
+}
+
+// liveKind guesses the contract's kind from a filename, so an operator pointing
+// WAC_LIVE_FILE at a PDF does not also have to say what a PDF is.
+func liveKind(name string) string {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".jpg", ".jpeg", ".png":
+		return "image"
+	case ".mp4", ".mov":
+		return "video"
+	case ".ogg", ".opus", ".mp3", ".m4a":
+		return "audio"
+	case ".webp":
+		return "sticker"
+	default:
+		return "document"
+	}
+}
+
+// liveMime is what the little server labels the file with, so the phase also exercises
+// the fallback that reads the mimetype off the response.
+func liveMime(name string) string {
+	if guessed := mime.TypeByExtension(strings.ToLower(filepath.Ext(name))); guessed != "" {
+		return guessed
+	}
+	return "application/octet-stream"
+}
+
+func TestLiveLogout(t *testing.T) {
+	if os.Getenv("WAC_LIVE_LOGOUT") != "yes" {
+		t.Skip("set WAC_LIVE_LOGOUT=yes to unlink the device")
+	}
+
+	session, container := liveSession(t)
+	events := watch(t, session)
+
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	events.awaitState(t, "open", 2*time.Minute)
+
+	if err := session.Logout(t.Context()); err != nil {
+		t.Fatalf("Logout: %v", err)
+	}
+	events.await(t, protocol.EventSessionLoggedOut, 60*time.Second)
+
+	if _, bound, err := container.For(liveSID).JID(t.Context()); err != nil || bound {
+		t.Fatalf("the mapping survived a logout (bound=%v, err=%v)", bound, err)
+	}
+}
+
+// liveSession opens the durable store and one session on it, with nowhere to keep a
+// file. Every phase but the media ones wants that.
+func liveSession(t *testing.T) (*Session, *store.Container) {
+	t.Helper()
+
+	return liveSessionWith(t, MediaOptions{})
+}
+
+// liveSessionWith is the same, with somewhere to put the file of an inbound message.
+func liveSessionWith(t *testing.T, blobs MediaOptions) (*Session, *store.Container) {
+	t.Helper()
+
+	waEngine, container := liveEngine(t, blobs)
+	return liveSessionOn(t, waEngine, container, liveSID), container
+}
+
+// liveBoth opens the account under test and the counterpart on one engine, which is what
+// a phase needing two sides of a conversation runs on.
+func liveBoth(t *testing.T, blobs MediaOptions) (subject, counterpart *Session, container *store.Container) {
+	t.Helper()
+
+	waEngine, container := liveEngine(t, blobs)
+	return liveSessionOn(t, waEngine, container, liveSID),
+		liveSessionOn(t, waEngine, container, liveCounterpartSID), container
+}
+
+// liveSessionOn opens one session on an engine that is already up, and says which account
+// it turned out to be -- the log line is what tells the two apart in a phase driving both.
+func liveSessionOn(t *testing.T, waEngine engine.Engine, container *store.Container, sid string) *Session {
+	t.Helper()
+
+	opened, err := waEngine.Open(t.Context(), sid)
+	if err != nil {
+		t.Fatalf("Open %s: %v", sid, err)
+	}
+	session, ok := opened.(*Session)
+	if !ok {
+		t.Fatalf("the engine handed back a %T for %s", opened, sid)
+	}
+	if jid, bound, err := container.For(sid).JID(t.Context()); err == nil && bound {
+		t.Logf("%s is %s", sid, jid)
+	}
+	return session
+}
+
+// liveEngine opens the store and the engine the sessions above run on.
+func liveEngine(t *testing.T, blobs MediaOptions) (engine.Engine, *store.Container) {
+	t.Helper()
+
+	path := os.Getenv("WAC_LIVE_DB")
+	if path == "" {
+		path = filepath.Join(liveDir(t), "live.db")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("prepare %s: %v", filepath.Dir(path), err)
+	}
+
+	log := zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.TimeOnly}).
+		Level(zerolog.DebugLevel).With().Timestamp().Logger()
+
+	container, err := store.Open(t.Context(), "sqlite:"+path, store.AlwaysOwned, log)
+	if err != nil {
+		t.Fatalf("open the store at %s: %v", path, err)
+	}
+	t.Cleanup(func() {
+		if err := container.Close(); err != nil {
+			t.Errorf("close the store: %v", err)
+		}
+	})
+	t.Logf("store: %s", path)
+
+	waEngine := mustEngine(t, container, Options{DeviceName: "fazer.ai live check", Media: blobs}, log)
+	t.Cleanup(func() {
+		if err := waEngine.Close(); err != nil {
+			t.Errorf("close the engine: %v", err)
+		}
+	})
+
+	return waEngine, container
+}
+
+// liveDir is where the store and the rendered codes go. Outside the repo, because a
+// pairing is a credential and the working tree is not where credentials live.
+func liveDir(t *testing.T) string {
+	t.Helper()
+
+	if dir := os.Getenv("WAC_LIVE_OUT"); dir != "" {
+		return dir
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("resolve the home directory: %v", err)
+	}
+	return filepath.Join(home, ".local", "state", "whatsapp-connector-live")
+}
+
+// liveDeadline is how long a phase waits on a human. Scanning a code is the only step
+// that does, so it is the only one that reads the override.
+func liveDeadline(t *testing.T, fallback time.Duration) time.Duration {
+	t.Helper()
+
+	raw := os.Getenv("WAC_LIVE_SCAN_SECONDS")
+	if raw == "" {
+		return fallback
+	}
+	seconds, err := strconv.Atoi(raw)
+	if err != nil {
+		t.Fatalf("WAC_LIVE_SCAN_SECONDS=%q: %v", raw, err)
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+// recorder is the reader of the session's event channel. Every phase needs one, and
+// there can only be one: Events is a channel, so a second reader would steal frames
+// from the first.
+type recorder struct {
+	seen    chan engine.Emission
+	tally   map[protocol.EventType]*atomic.Int64
+	dropped atomic.Int64
+}
+
+// liveWatchers is the one reader of each session's events, and the watchers it feeds.
+//
+// `Session.Events()` hands back a single channel, so two goroutines ranging over it split
+// the stream between them: each event reaches one and is lost to the other, and which one
+// is a coin flip per event. That is not hypothetical -- `liveResume` opens a watcher of
+// its own, so every phase that watched a session and then resumed it was reading about
+// half of what arrived, and passing on the runs where the half it wanted came its way.
+//
+// So the session is read once and the emissions are handed to every watcher of it. A
+// phase can watch a session it also resumes, and two phases can watch the same session
+// for different things, without either eating the other's events.
+var liveWatchers = struct {
+	sync.Mutex
+	of map[*Session]*fanout
+}{of: map[*Session]*fanout{}}
+
+type fanout struct {
+	sync.Mutex
+	to    []*recorder
+	dir   string
+	codes atomic.Int64
+}
+
+func watch(t *testing.T, session *Session) *recorder {
+	t.Helper()
+
+	r := &recorder{
+		seen:  make(chan engine.Emission, 256),
+		tally: make(map[protocol.EventType]*atomic.Int64, 24),
+	}
+
+	liveWatchers.Lock()
+	source, running := liveWatchers.of[session]
+	if !running {
+		source = &fanout{dir: liveDir(t)}
+		liveWatchers.of[session] = source
+	}
+	liveWatchers.Unlock()
+
+	source.Lock()
+	source.to = append(source.to, r)
+	source.Unlock()
+
+	if running {
+		return r
+	}
+	go func() {
+		for emission := range session.Events() {
+			source.record(&emission)
+			// This harness stands in for the publisher, so it owes the same answer:
+			// an inbound message waits here for word that its event landed, and a
+			// reader that only drains the channel leaves every one of them stalled
+			// until the session gives up and refuses the acknowledgement.
+			if emission.Settle != nil {
+				emission.Settle(nil)
+			}
+			source.Lock()
+			watchers := slices.Clone(source.to)
+			source.Unlock()
+			for _, watcher := range watchers {
+				watcher.tallyUp(emission.Type)
+				select {
+				case watcher.seen <- emission:
+				default:
+					// A phase that is not reading fast enough must not stall the
+					// session's own forwarder, which is what publishes the state.
+					//
+					// Counted, because dropping in silence is what makes the wait
+					// that follows unreadable: a phase whose event was thrown away
+					// waits out its whole deadline and then reports the event as
+					// never having arrived, which is a description of the connector
+					// and not of this buffer. Every wait below says so when it gives
+					// up.
+					watcher.dropped.Add(1)
+				}
+			}
+		}
+		source.Lock()
+		watchers := slices.Clone(source.to)
+		source.to = nil
+		source.Unlock()
+		for _, watcher := range watchers {
+			close(watcher.seen)
+		}
+	}()
+	return r
+}
+
+// tallyUp counts an event for one watcher. Counted on the way in rather than as it is
+// read, because `count` is asked about events no phase waits for -- whether a QR was ever
+// offered, when the phase is checking that resuming did not ask for one.
+func (r *recorder) tallyUp(eventType protocol.EventType) {
+	counter, ok := r.tally[eventType]
+	if !ok {
+		counter = &atomic.Int64{}
+		r.tally[eventType] = counter
+	}
+	counter.Add(1)
+}
+
+// record prints one event and, for a pairing image, writes it somewhere a camera can
+// reach. The payload of everything else goes out whole: this is a debugging harness on
+// a throwaway account, and eliding the field that explains the failure defeats it.
+//
+// It writes to stderr rather than through t.Logf because the testing package buffers a
+// test's log until the test ends, and a pairing code nobody sees until the deadline has
+// passed is a pairing code nobody can scan.
+func (r *fanout) record(emission *engine.Emission) {
+	if emission.Type == protocol.EventPairingQR {
+		path, expires, err := r.writeCode(emission.Payload)
+		if err != nil {
+			say("could not save the pairing image: %v", err)
+			return
+		}
+		say("SCAN THIS: %s (valid for %s)", path, expires)
+		return
+	}
+	say("%-28s %s", emission.Type, emission.Payload)
+}
+
+// say reports one line as it happens, timestamped like the logger beside it.
+func say(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "%s EVENT %s\n", time.Now().Format(time.TimeOnly), fmt.Sprintf(format, args...))
+}
+
+// writeCode turns the data URL the contract carries back into a file.
+func (r *fanout) writeCode(payload json.RawMessage) (string, time.Duration, error) {
+	var body struct {
+		Image     string `json:"png_data_url"`
+		ExpiresIn int64  `json:"expires_in_ms"`
+	}
+	if err := json.Unmarshal(payload, &body); err != nil {
+		return "", 0, err
+	}
+	const prefix = "data:image/png;base64,"
+	if !strings.HasPrefix(body.Image, prefix) {
+		return "", 0, fmt.Errorf("the payload carries no png: %.40s", body.Image)
+	}
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(body.Image, prefix))
+	if err != nil {
+		return "", 0, err
+	}
+	if err := os.MkdirAll(r.dir, 0o700); err != nil {
+		return "", 0, err
+	}
+	// The newest code overwrites the last, so whoever is holding the phone is always
+	// looking at the one that is still valid; the numbered copy is for the log.
+	path := filepath.Join(r.dir, fmt.Sprintf("qr-%02d.png", r.codes.Add(1)))
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		return "", 0, err
+	}
+	current := filepath.Join(r.dir, "qr.png")
+	if err := os.WriteFile(current, raw, 0o600); err != nil {
+		return "", 0, err
+	}
+	return current, time.Duration(body.ExpiresIn) * time.Millisecond, nil
+}
+
+// overflowed is what to add to a deadline's complaint: whether this watcher's buffer
+// filled up while it was not being read, which is the difference between "the connector
+// never sent it" and "this phase was not listening when it did".
+func (r *recorder) overflowed() string {
+	if dropped := r.dropped.Load(); dropped > 0 {
+		return fmt.Sprintf(" (%d emissions were dropped: this watcher's buffer filled "+
+			"before anything drained it, so what was waited for may well have arrived)", dropped)
+	}
+	return ""
+}
+
+func (r *recorder) count(eventType protocol.EventType) int64 {
+	if counter, ok := r.tally[eventType]; ok {
+		return counter.Load()
+	}
+	return 0
+}
+
+// await blocks until one event type arrives, and fails on a pairing that ended badly
+// rather than waiting out the deadline on a session that is never going to connect.
+func (r *recorder) await(t *testing.T, want protocol.EventType, within time.Duration) engine.Emission {
+	t.Helper()
+
+	deadline := time.After(within)
+	for {
+		select {
+		case emission, ok := <-r.seen:
+			if !ok {
+				t.Fatalf("the session ended before %s arrived", want)
+			}
+			if emission.Type == want {
+				return emission
+			}
+			if emission.Type == protocol.EventPairingError && want != protocol.EventPairingError {
+				t.Fatalf("the pairing failed while waiting for %s: %s", want, emission.Payload)
+			}
+			if emission.Type == protocol.EventSessionLoggedOut && want != protocol.EventSessionLoggedOut {
+				t.Fatalf("the account was logged out while waiting for %s: %s", want, emission.Payload)
+			}
+		case <-deadline:
+			t.Fatalf("%s did not arrive within %s%s", want, within, r.overflowed())
+		}
+	}
+}
+
+// awaitMessage waits for one message.received by id, ignoring every other message that
+// arrives meanwhile, and hands back the message out of its envelope.
+//
+// Waiting for "the next message.received" is only right on an account nobody else is
+// talking to, which is not an account. A resume delivers whatever came in while the
+// session was down, and the far side answers on its own schedule -- on the demo number
+// this harness talks to, a bot answers within a second. The first event to arrive is
+// then somebody else's, and the phase reports the wrong body against the right send,
+// which reads as the connector having mangled the message.
+func (r *recorder) awaitMessage(t *testing.T, id string, within time.Duration) json.RawMessage {
+	t.Helper()
+
+	body, arrived := r.sawMessage(t, id, within)
+	if !arrived {
+		t.Fatalf("message %s did not arrive within %s%s", id, within, r.overflowed())
+	}
+	return body
+}
+
+// sawMessage is awaitMessage without the verdict: whether the message turned up, for a
+// caller that has something to do about it not having. Everything except the deadline is
+// still fatal -- a logged-out session or an unreadable emission is not an answer to the
+// question, it is the harness having lost the ability to answer it.
+func (r *recorder) sawMessage(t *testing.T, id string, within time.Duration) (json.RawMessage, bool) {
+	t.Helper()
+
+	deadline := time.After(within)
+	for {
+		select {
+		case emission, ok := <-r.seen:
+			if !ok {
+				t.Fatalf("the session ended before message %s arrived", id)
+			}
+			if emission.Type == protocol.EventSessionLoggedOut {
+				t.Fatalf("the account was logged out while waiting for message %s, so it has to be paired again: %s",
+					id, emission.Payload)
+			}
+			if emission.Type != protocol.EventMessageReceived {
+				continue
+			}
+			var envelope struct {
+				Message json.RawMessage `json:"message"`
+			}
+			if err := json.Unmarshal(emission.Payload, &envelope); err != nil {
+				t.Fatalf("unmarshal a message.received: %v", err)
+			}
+			var named struct {
+				ID string `json:"id"`
+			}
+			if err := json.Unmarshal(envelope.Message, &named); err != nil {
+				t.Fatalf("unmarshal the message inside a message.received: %v", err)
+			}
+			if named.ID == id {
+				return envelope.Message, true
+			}
+		case <-deadline:
+			return nil, false
+		}
+	}
+}
+
+// awaitState waits for one value of session.state, ignoring the ones on the way to it.
+func (r *recorder) awaitState(t *testing.T, want string, within time.Duration) {
+	t.Helper()
+
+	deadline := time.After(within)
+	for {
+		select {
+		case emission, ok := <-r.seen:
+			if !ok {
+				t.Fatalf("the session ended before it reported %q", want)
+			}
+			// The same two dead ends `await` refuses, for the same reason: neither
+			// is a state on the way to another one, so waiting out the deadline
+			// only replaces an answer that already arrived with a timeout that
+			// says nothing. A logged-out account is the one that costs the most to
+			// misread -- it is answered by pairing again, and the generic timeout
+			// sends you looking at the network instead.
+			if emission.Type == protocol.EventSessionLoggedOut {
+				t.Fatalf("the account was logged out while waiting for %q, so it has to be paired again: %s",
+					want, emission.Payload)
+			}
+			if emission.Type == protocol.EventPairingError {
+				t.Fatalf("the pairing failed while waiting for %q: %s", want, emission.Payload)
+			}
+			if emission.Type != protocol.EventSessionState {
+				continue
+			}
+			var body struct {
+				State string `json:"state"`
+			}
+			if err := json.Unmarshal(emission.Payload, &body); err != nil {
+				t.Fatalf("unmarshal a session state: %v", err)
+			}
+			if body.State == want {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("the session did not report %q within %s%s", want, within, r.overflowed())
+		}
+	}
+}
+
+// TestLiveWatchAReceipt is the receipt half against a real phone, and it is the only
+// thing that can answer the question this slice is built on: which of whatsmeow's eleven
+// receipt types WhatsApp actually sends for an ordinary message, and in what order.
+//
+// The mapping table in receipt.go was read off the library's own constants, which says
+// what each type means and not which ones arrive. A direct chat is the case every
+// deployment is made of, and until one is watched the whole file is a reading.
+//
+// Both receipts are collected in any order rather than one after the other. WhatsApp
+// coalesces a chat being opened into a single read over everything unread in it, so the
+// delivered and the read can arrive together, and a phase that waited for one and then
+// the other would consume the second while waiting for the first.
+func TestLiveWatchAReceipt(t *testing.T) {
+	to := os.Getenv("WAC_LIVE_TO")
+	if to == "" {
+		t.Skip("set WAC_LIVE_TO to the number this account should send to")
+	}
+	window := liveWindow(t, 5*time.Minute)
+
+	session, _ := liveSession(t)
+	events := watch(t, session)
+
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	events.awaitState(t, "open", 2*time.Minute)
+
+	payload, err := json.Marshal(map[string]any{
+		"message_id": session.current().GenerateMessageID(),
+		"to":         map[string]any{"kind": "phone", "id": to},
+		"content":    map[string]any{"type": "text", "body": "conector nativo, fatia de recibos"},
+	})
+	if err != nil {
+		t.Fatalf("build the send: %v", err)
+	}
+	result, err := session.Execute(t.Context(), &protocol.Command{
+		Type: protocol.CommandMessageSend, Payload: payload,
+	})
+	if err != nil {
+		t.Fatalf("message.send: %v", err)
+	}
+	var sent struct {
+		MessageID string `json:"message_id"`
+	}
+	if err := json.Unmarshal(result, &sent); err != nil {
+		t.Fatalf("unmarshal the send: %v", err)
+	}
+
+	fmt.Fprintf(os.Stderr,
+		"a message went out to %s. leave it unread for a moment, then open the chat and read it.\nwaiting up to %s\n",
+		to, window)
+
+	seen := map[string]map[string]any{}
+	deadline := time.After(window)
+
+collect:
+	for {
+		select {
+		case emission, ok := <-events.seen:
+			if !ok {
+				t.Fatal("the session ended before the phase finished")
+			}
+			if emission.Type != protocol.EventMessageReceipt {
+				continue
+			}
+			body := struct {
+				MessageIDs []string       `json:"message_ids"`
+				Type       string         `json:"type"`
+				Chat       map[string]any `json:"chat"`
+				Part       map[string]any `json:"participant"`
+			}{}
+			if err := json.Unmarshal(emission.Payload, &body); err != nil {
+				t.Fatalf("unmarshal a receipt: %v", err)
+			}
+			if !slices.Contains(body.MessageIDs, sent.MessageID) {
+				// A receipt over something else in the same chat, which is ordinary and
+				// says nothing about the message this phase sent.
+				fmt.Fprintf(os.Stderr, "a %s over other messages: %v\n", body.Type, body.MessageIDs)
+				continue
+			}
+			seen[body.Type] = map[string]any{"chat": body.Chat, "participant": body.Part}
+			if len(seen) == 2 {
+				break collect
+			}
+		case <-deadline:
+			break collect
+		}
+	}
+
+	for _, want := range []string{"delivered", "read"} {
+		if _, arrived := seen[want]; !arrived {
+			t.Errorf("no %s arrived within %s; what did: %v", want, window, keysOf(seen))
+		}
+	}
+	if t.Failed() {
+		return
+	}
+	for kind, receipt := range seen {
+		// Who reported it, which is the field that separates a receipt about a message
+		// this account sent from one about a message it read somewhere else. In a direct
+		// chat the contact is both the chat and the participant, and that is the reading
+		// no fixture could have confirmed.
+		fmt.Fprintf(os.Stderr, "%s: chat=%v participant=%v\n", kind, receipt["chat"], receipt["participant"])
+		if receipt["participant"] == nil {
+			t.Errorf("the %s receipt does not say whose device reported it", kind)
+		}
+	}
+
+	// The other direction, which no assertion here can reach: the proof is two blue
+	// ticks appearing on the other phone, and only whoever is holding it can see them.
+	fmt.Fprintln(os.Stderr, "now send a message from that phone, so the read mark has something to be about.")
+	inbound := events.await(t, protocol.EventMessageReceived, window)
+	arrived := struct {
+		Message struct {
+			ID   string `json:"id"`
+			Chat struct {
+				Kind string `json:"kind"`
+				ID   string `json:"id"`
+			} `json:"chat"`
+		} `json:"message"`
+	}{}
+	if err := json.Unmarshal(inbound.Payload, &arrived); err != nil {
+		t.Fatalf("unmarshal the inbound message: %v", err)
+	}
+	mark, err := json.Marshal(map[string]any{
+		"chat":        map[string]any{"kind": arrived.Message.Chat.Kind, "id": arrived.Message.Chat.ID},
+		"message_ids": []string{arrived.Message.ID},
+	})
+	if err != nil {
+		t.Fatalf("build the read mark: %v", err)
+	}
+	if _, err := session.Execute(t.Context(), &protocol.Command{
+		Type: protocol.CommandMessageMarkRead, Payload: mark,
+	}); err != nil {
+		t.Fatalf("message.mark_read: %v", err)
+	}
+	fmt.Fprintf(os.Stderr, "marked %s read. check the other phone: the message it just sent should show two blue ticks.\n",
+		arrived.Message.ID)
+}
+
+// TestLiveWatchPresence is the presence half against a real phone, and it exists for one
+// state: `recording`.
+//
+// WhatsApp has no such state. It has `composing` with a media attribute beside it, and
+// that reading came off the library's constants rather than off anything anybody sent.
+// Every other mapping in this slice is one name onto one name; this one is a guess about
+// which field carries the difference, and a guess is what a live phase is for.
+//
+// The account is marked available first, which is not decoration: whatsmeow only sends
+// real delivery receipts while it is, and WhatsApp sends presence about a party only
+// after it is subscribed to. Both halves of this phase depend on those two calls having
+// worked, so a failure in them shows up here as nothing arriving.
+func TestLiveWatchPresence(t *testing.T) {
+	to := os.Getenv("WAC_LIVE_TO")
+	if to == "" {
+		t.Skip("set WAC_LIVE_TO to the number whose presence this should watch")
+	}
+	window := liveWindow(t, 5*time.Minute)
+
+	session, _ := liveSession(t)
+	events := watch(t, session)
+
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	events.awaitState(t, "open", 2*time.Minute)
+
+	if _, err := session.Execute(t.Context(), &protocol.Command{
+		Type: protocol.CommandPresenceSet, Payload: json.RawMessage(`{"state":"available"}`),
+	}); err != nil {
+		t.Fatalf("presence.set: %v", err)
+	}
+	party := fmt.Sprintf(`{"party":{"kind":"phone","id":%q}}`, to)
+	if _, err := session.Execute(t.Context(), &protocol.Command{
+		Type: protocol.CommandPresenceSubscribe, Payload: json.RawMessage(party),
+	}); err != nil {
+		t.Fatalf("presence.subscribe: %v", err)
+	}
+
+	// Sent before the wait rather than after it, so whoever is holding the phone has the
+	// typing bubble in front of them while they do their half.
+	chat := fmt.Sprintf(`{"chat":{"kind":"phone","id":%q},"state":"composing"}`, to)
+	if _, err := session.Execute(t.Context(), &protocol.Command{
+		Type: protocol.CommandChatPresence, Payload: json.RawMessage(chat),
+	}); err != nil {
+		t.Fatalf("chat.presence: %v", err)
+	}
+
+	fmt.Fprintf(os.Stderr,
+		"from that phone, in this chat, and in this order:\n"+
+			"  1. type a few characters, then stop and wait a few seconds -- do not send\n"+
+			"  2. hold the microphone as if recording a voice note, then let go\n"+
+			"the stop after the typing is what this is really here for: it is the state the\n"+
+			"whole board is built around, and nothing follows it if it never comes.\n"+
+			"also check whether this account shows as typing on your side.\nwaiting up to %s\n",
+		window)
+
+	seen := map[string]json.RawMessage{}
+	// What each state said its own moment was. The frame's `ts` comes from this, and a
+	// reader is asked to decide on a typing indicator by it, so a run that never looks at
+	// it has taken the one field this milestone added on trust.
+	learnedAt := map[string]int64{}
+	deadline := time.After(window)
+
+collect:
+	for {
+		select {
+		case emission, ok := <-events.seen:
+			if !ok {
+				t.Fatal("the session ended before the phase finished")
+			}
+			switch emission.Type {
+			case protocol.EventChatPresence:
+				var body struct {
+					State string `json:"state"`
+				}
+				if err := json.Unmarshal(emission.Payload, &body); err != nil {
+					t.Fatalf("unmarshal a chat presence: %v", err)
+				}
+				seen[body.State], learnedAt[body.State] = emission.Payload, emission.At
+			case protocol.EventPresenceUpdate:
+				seen["presence"], learnedAt["presence"] = emission.Payload, emission.At
+			default:
+				continue
+			}
+			if len(seen) >= 3 {
+				_, typing := seen["composing"]
+				_, stopped := seen["paused"]
+				_, recording := seen["recording"]
+				if typing && stopped && recording {
+					break collect
+				}
+			}
+		case <-deadline:
+			break collect
+		}
+	}
+
+	// Measured on 29/08/2026: all three arrive, the stop about six seconds after the
+	// typing it ends, and a direct chat's presence comes addressed by LID with no number
+	// anywhere on it -- `SenderAlt` is empty, so the event answers nothing about the
+	// other namespace. That is what the resolution in addressing.go is for, and this run
+	// is the measurement it was written from: the mapping comes from the device store,
+	// because there is nothing on the event to prefer.
+	//
+	// The stop is required and not optional. Everything about how presence is queued
+	// turns on it existing: a typing indicator has nothing after it, so the board keeps
+	// the last state per chat rather than a queue of them, and a client left showing
+	// somebody typing has no second chance. A build that never receives one has been
+	// designed around a state WhatsApp does not send.
+	for _, want := range []string{"composing", "paused", "recording"} {
+		if _, arrived := seen[want]; !arrived {
+			t.Errorf("no %s arrived within %s; what did: %v", want, window, rawKeysOf(seen))
+		}
+	}
+	for _, state := range rawKeysOf(seen) {
+		fmt.Fprintf(os.Stderr, "%s: at=%d %s\n", state, learnedAt[state], seen[state])
+	}
+	// Not a failure: it only arrives if the other phone changed state while this ran,
+	// and somebody with the chat open the whole time never does.
+	if _, arrived := seen["presence"]; !arrived {
+		fmt.Fprintln(os.Stderr, "no presence.update arrived, which is what a phone that stayed put looks like")
+	}
+	if state := session.state(); state != "open" {
+		t.Fatalf("the session did not stay up: state=%s", state)
+	}
+}
+
+func rawKeysOf(seen map[string]json.RawMessage) []string {
+	kinds := make([]string, 0, len(seen))
+	for kind := range seen {
+		kinds = append(kinds, kind)
+	}
+	sort.Strings(kinds)
+	return kinds
+}
+
+// TestLiveShowTyping settles what a typing indicator has to have behind it before the
+// other phone renders one, which is the half no event can answer: `SendChatPresence`
+// writes the node and returns, so one nothing renders comes back successful.
+//
+// What it found, on 29/08/2026: the address is not the problem. A typing indicator shows
+// by number and by LID alike, and the only one that did not show was the very first of a
+// session, sent in the same breath as the `available` before it.
+//
+// What that first one was missing is not settled, and this test cannot settle it as
+// written. Round A is meant to be the arm with nothing behind it but a wait, and it only
+// has nothing behind it *within this process*: the run before it had put four messages
+// into the same chat minutes earlier, so the peer's own subscription was still warm.
+// Separating the two would mean leaving that chat quiet for however long a subscription
+// takes to lapse, which is a length nobody here knows, and then connecting fresh and
+// sending exactly one thing. Until somebody does that, what a client can rely on is only
+// that the first typing indicator of a session may not show -- which is what the
+// contract says, and it is the same advice under either explanation.
+//
+// Each round ends with a real message, which is what makes the answer readable at all: a
+// typing indicator on its own leaves somebody staring at a chat with no way to say when
+// they were supposed to be looking, while a message lands in the history, names its round
+// and clears the indicator the way a real client would. So the phone is left holding the
+// answer instead of the person having to catch it.
+func TestLiveShowTyping(t *testing.T) {
+	to := os.Getenv("WAC_LIVE_TO")
+	if to == "" {
+		t.Skip("set WAC_LIVE_TO to the number to show a typing indicator to")
+	}
+	show := liveWindow(t, 12*time.Second)
+
+	session, _ := liveSession(t)
+	events := watch(t, session)
+
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	events.awaitState(t, "open", 2*time.Minute)
+
+	if _, err := session.Execute(t.Context(), &protocol.Command{
+		Type: protocol.CommandPresenceSet, Payload: json.RawMessage(`{"state":"available"}`),
+	}); err != nil {
+		t.Fatalf("presence.set: %v", err)
+	}
+
+	// The other namespace for the same person, out of the device store, which is where
+	// the mapping already is. A run that cannot find it says so rather than testing one
+	// address twice.
+	number := waTypes.NewJID(to, waTypes.DefaultUserServer)
+	alt, err := session.current().Store.GetAltJID(t.Context(), number)
+	if err != nil {
+		t.Fatalf("look up the other address of %s: %v", to, err)
+	}
+	if alt.IsEmpty() {
+		t.Fatalf("the store has no LID for %s, so there is nothing to compare against", to)
+	}
+	byNumber := protocol.Address{Kind: protocol.AddressPhone, ID: number.User}
+	byLID := protocol.Address{Kind: protocol.AddressLID, ID: alt.User}
+	fmt.Fprintf(os.Stderr, "the same person is %s and %s\n", number, alt)
+
+	// Nothing at all goes to that chat first, which is what makes round A mean something:
+	// it is the availability having had time to land and nothing else.
+	settle := 15 * time.Second
+	fmt.Fprintf(os.Stderr, "\nmarked available. waiting %s with nothing going out, so the first round\n"+
+		"is about the availability having landed rather than about the chat being woken up\n", settle)
+	time.Sleep(settle)
+
+	for _, round := range []struct {
+		label string
+		chat  protocol.Address
+	}{
+		{label: "A — numero, so esperei", chat: byNumber},
+		{label: "B — lid", chat: byLID},
+		{label: "C — numero, com mensagem atras", chat: byNumber},
+	} {
+		fmt.Fprintf(os.Stderr, "\n=== %s: typing to %s for %s ===\n", round.label, round.chat.ID, show)
+		showTyping(t, session, round.chat)
+		time.Sleep(show)
+		sendMarker(t, session, round.chat, round.label)
+		time.Sleep(3 * time.Second)
+	}
+
+	fmt.Fprintln(os.Stderr, "\nthree messages should be in that chat now, A B and C.\n"+
+		"for each one: was this account shown as typing in the seconds before it arrived?")
+	if state := session.state(); state != "open" {
+		t.Fatalf("the session did not stay up: state=%s", state)
+	}
+}
+
+func showTyping(t *testing.T, session *Session, chat protocol.Address) {
+	t.Helper()
+
+	payload, err := json.Marshal(map[string]any{"chat": chat, "state": "composing"})
+	if err != nil {
+		t.Fatalf("marshal a typing indicator: %v", err)
+	}
+	if _, err := session.Execute(t.Context(), &protocol.Command{
+		Type: protocol.CommandChatPresence, Payload: payload,
+	}); err != nil {
+		t.Fatalf("chat.presence for %s: %v", chat.ID, err)
+	}
+}
+
+// sendMarker sends the message that ends a round, which is what the phone is left holding
+// as the answer. No stop goes out first: a real client stops typing by sending, and
+// whether the indicator clears on its own is part of what this is looking at.
+func sendMarker(t *testing.T, session *Session, chat protocol.Address, body string) {
+	t.Helper()
+
+	payload, err := json.Marshal(map[string]any{
+		"message_id": session.current().GenerateMessageID(),
+		"to":         chat,
+		"content":    map[string]any{"type": "text", "body": body},
+	})
+	if err != nil {
+		t.Fatalf("marshal the marker: %v", err)
+	}
+	if _, err := session.Execute(t.Context(), &protocol.Command{
+		Type: protocol.CommandMessageSend, Payload: payload,
+	}); err != nil {
+		t.Fatalf("message.send to %s: %v", chat.ID, err)
+	}
+	fmt.Fprintf(os.Stderr, "=== sent %q to %s ===\n", body, chat.ID)
+}

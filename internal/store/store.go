@@ -1,0 +1,1220 @@
+// Package store is where a paired session survives a restart.
+//
+// It holds two things that belong together and are useless apart: whatsmeow's own
+// device store, which is where the Signal keys and the pairing live, and the mapping
+// from a client's session id onto the device that session paired. whatsmeow keys a
+// device by its JID, and a JID only exists once pairing has succeeded, so without that
+// mapping a restart cannot tell which of the stored devices belongs to which session
+// and every session would pair again.
+//
+// Ownership is arbitrated by the Redis lease, not here: one instance runs a session at
+// a time, and the layer above tears a session down within a heartbeat of losing it.
+//
+// What arbitration does not do on its own is stop a session that has been handed on from
+// finishing a write it had started, and those land on top of what the new owner has since
+// learned. Cancelling the session's context covers most of that for free -- whatsmeow gives
+// that context to every node handler, and a statement on a cancelled one is refused before
+// it reaches the database -- but not the work the library deliberately detaches from it.
+// Fence is the other half: it stands in front of every write a device can make and refuses
+// them all from the moment this instance stops owning the session, whichever context they
+// arrive with.
+//
+// The window between a lease running out and this instance learning it is covered by the
+// same fence, which asks the lease and not only this instance's own belief: a claim that
+// was renewed at a known moment, for a known TTL, has run out at a moment this instance
+// can work out on its own, before any renewal comes back to tell it.
+package store
+
+import (
+	"cmp"
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"net/url"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/rs/zerolog"
+
+	"go.mau.fi/whatsmeow/store"
+	"go.mau.fi/whatsmeow/store/sqlstore"
+	"go.mau.fi/whatsmeow/types"
+
+	// The two dialects the connector supports. Postgres is what a deployment runs;
+	// SQLite is the single-instance and test case, on the pure-Go driver so the image
+	// needs no cgo.
+	_ "github.com/lib/pq"
+	_ "modernc.org/sqlite"
+)
+
+// ErrNoDatabase is returned when the connector is asked for a store it was given no
+// address for. It is a configuration error rather than a runtime one: an engine that
+// cannot persist a pairing would ask every session to scan a QR code on every restart.
+var ErrNoDatabase = errors.New("store: no database url configured")
+
+// Container is the connector's whole persistence.
+type Container struct {
+	db      *sql.DB
+	devices *sqlstore.Container
+	dialect string
+	owned   Ownership
+	log     zerolog.Logger
+}
+
+// Ownership answers whether this instance may still write for a session. Every fenced
+// write asks it, so it is asked often and on the path of every message: it must answer
+// from local state and never over the network.
+//
+// The cluster's leases are what implement it in a deployment. A false no costs a
+// disconnect and a reclaim; a false yes puts two writers on one account's Signal state,
+// which is the failure this exists to prevent, so an implementation that cannot tell
+// answers no.
+type Ownership func(sid string) bool
+
+// AlwaysOwned is the arbiter for a container nothing else is competing for: the migrate
+// and doctor commands, and tests that drive the store directly. Passing it says out loud
+// that there is no second owner to arbitrate against, rather than leaving the question
+// unasked.
+func AlwaysOwned(string) bool { return true }
+
+// Open dials the database, brings both schemas up to date, and returns the container.
+//
+// The url decides the dialect: `postgres://…` or `postgresql://…` is Postgres,
+// `sqlite:…` or `file:…` is SQLite. Nothing is guessed from the file system, so a
+// typo fails here rather than silently opening a local file in a deployment that meant
+// to reach a server.
+//
+// owned is what every fenced write asks, and it is required rather than optional: a
+// container built without one would fence on this instance's own belief alone, which is
+// the half of the question that misses a lease already lost. A deployment with no second
+// owner passes AlwaysOwned and says so.
+//
+//nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
+func Open(ctx context.Context, address string, owned Ownership, log zerolog.Logger) (*Container, error) {
+	return OpenWith(ctx, address, owned, log, Options{})
+}
+
+// Options are the knobs a deployment sets and a test does not care about.
+type Options struct {
+	// MaxConns caps the Postgres pool. Zero takes DefaultMaxConns, which exists because
+	// database/sql's own default is no cap at all: a burst of concurrent queries opens a
+	// connection per query, and Postgres ships with `max_connections = 100` for the whole
+	// server. Reaching it does not slow this connector down, it refuses connections to
+	// every other application on that database.
+	//
+	// Sessions do not hold one each. There is a single pool per process, shared by
+	// whatsmeow's device store and this package's tables, and a connection is taken per
+	// query and given back -- which is why the number that matters is how many queries
+	// run at once, not how many accounts are paired.
+	//
+	// Opening takes one connection more than this, held outside the pool and only until
+	// the schema is up: see holdTheSchemaUpgrade.
+	//
+	// SQLite ignores it: a file holds one writer whatever the pool says.
+	MaxConns int
+}
+
+// DefaultMaxConns leaves room for several connectors and everything else on a Postgres
+// that was never reconfigured. An instance that needs more says so.
+const DefaultMaxConns = 20
+
+// OpenWith is Open with the knobs a deployment sets. Open is the same call with none of
+// them, which is what every test and every caller that does not run a fleet wants.
+//
+//nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
+func OpenWith(ctx context.Context, address string, owned Ownership, log zerolog.Logger, opts Options) (*Container, error) {
+	if owned == nil {
+		return nil, errors.New("store: open without an owner arbiter (pass AlwaysOwned where nothing competes)")
+	}
+	dialect, dsn, err := parseURL(address)
+	if err != nil {
+		return nil, err
+	}
+
+	// One pool, not two. whatsmeow's store and this package's own table live in the
+	// same database, and opening them separately gave SQLite two independent sets of
+	// connections writing one file: the first real pairing filled the log with
+	// `database is locked (5)` from whatsmeow trying to save an identity key while the
+	// mapping was being written, and a message that cannot have its identity saved
+	// cannot be decrypted.
+	var db *sql.DB
+	if dialect == dialectSQLite {
+		// Not `sql.Open`: the connector is wrapped so every statement runs under a
+		// `busy_timeout` derived from its caller's deadline. Why that has to happen
+		// under `*sql.DB` rather than at the call sites is in `sqlitebudget.go`.
+		connector, err := sqliteBudgeted(dsn)
+		if err != nil {
+			return nil, err
+		}
+		db = sql.OpenDB(connector)
+		// A file holds one writer at a time whatever the pool says, and a pool that
+		// hands out more connections than that only converts waiting into
+		// `database is locked`. Serialising here is what makes busy_timeout the
+		// backstop rather than the mechanism -- and it is also why the budget above
+		// has to be set on every statement: one connection is one shared setting.
+		db.SetMaxOpenConns(1)
+	} else {
+		opened, err := sql.Open(dialect, dsn)
+		if err != nil {
+			return nil, fmt.Errorf("store: open %s: %w", dialect, err)
+		}
+		db = opened
+		maxConns := opts.MaxConns
+		if maxConns <= 0 {
+			maxConns = DefaultMaxConns
+		}
+		db.SetMaxOpenConns(maxConns)
+		// Held open between queries, so a busy instance is not paying a TLS handshake per
+		// message. Left at the library's default of two, every burst past the second
+		// concurrent query dials, works, and closes.
+		db.SetMaxIdleConns(maxConns)
+		db.SetConnMaxIdleTime(idleConnLifetime)
+	}
+
+	if dialect == dialectPostgres {
+		release, err := holdTheSchemaUpgrade(ctx, dsn)
+		if err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+		defer release()
+		if err := refuseAnUnreachableVersionTable(ctx, db); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+		if err := refuseASplitAcrossSchemas(ctx, db); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+	}
+	devices := sqlstore.NewWithDB(db, dialect, nil)
+	if err := devices.Upgrade(ctx); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("store: open the device store: %w", err)
+	}
+
+	c := &Container{db: db, devices: devices, dialect: dialect, owned: owned, log: log}
+	if err := c.migrate(ctx); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	return c, nil
+}
+
+// schemaUpgradeLock is the Postgres advisory lock the schema checks and upgrades run
+// under. Advisory locks are scoped to the database, so connectors on different databases
+// of one server do not wait for each other.
+const schemaUpgradeLock int64 = 0x7761635f73636865 // "wac_sche"
+
+// holdTheSchemaUpgrade makes the instances that open one Postgres database at the same
+// time take turns at bringing its schema up, and returns what lets the next one in.
+//
+// whatsmeow's upgrade and this package's migration both create with `IF NOT EXISTS`,
+// which is not safe against a concurrent create of the same name: both sessions pass the
+// check and the second fails on the unique index of `pg_type`, so on an empty database
+// every replica but one died on its first start (#359). Taking turns costs the replicas
+// that come second a wait for work that is then a no-op.
+//
+// The lock lives on a connection of its own, outside the store's pool, because it has to
+// be held while the upgrade runs on the pool: with `MaxConns` at one, a lock held on a
+// pooled connection would leave the upgrade nothing to run on. Waiting honours ctx, which
+// lib/pq turns into a cancel request, and closing the connection ends the session, which
+// is what releases a session-level lock even when the unlock is never sent.
+func holdTheSchemaUpgrade(ctx context.Context, dsn string) (func(), error) {
+	lockDB, err := sql.Open(dialectPostgres, dsn)
+	if err != nil {
+		return nil, fmt.Errorf("store: open the schema upgrade lock: %w", err)
+	}
+	lockDB.SetMaxOpenConns(1)
+	conn, err := lockDB.Conn(ctx)
+	if err != nil {
+		_ = lockDB.Close()
+		return nil, fmt.Errorf("store: connect for the schema upgrade lock: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock($1)`, schemaUpgradeLock); err != nil {
+		_ = conn.Close()
+		_ = lockDB.Close()
+		return nil, fmt.Errorf("store: wait for another instance's schema upgrade: %w", err)
+	}
+	return func() {
+		_ = conn.Close()
+		_ = lockDB.Close()
+	}, nil
+}
+
+// whatsmeowVersionTable is the name whatsmeow's sqlstore gives go.mau.fi/util/dbutil for
+// the table it keeps its schema version in.
+const whatsmeowVersionTable = "whatsmeow_version"
+
+// refuseAnUnreachableVersionTable stops a start that whatsmeow's upgrade would end with an
+// error pointing at a table that exists.
+//
+// dbutil decides whether the version table needs creating by asking
+// `information_schema` for it by name alone, with no schema condition, and then reads it
+// by bare name, which resolves through `search_path`. When a schema the path does not
+// reach has one, the first answer is yes and the read fails with `relation
+// "whatsmeow_version" does not exist`. Two connectors with a schema each in one database,
+// a role whose `search_path` was changed, or another application's table of that name
+// all get there, and the upgrade cannot be pointed anywhere else from here.
+//
+// The question asked is the one dbutil asks, through the same view, so a table the role
+// has no privilege on is invisible here exactly as it is to the upgrade: that case
+// creates its own tables and starts, and refusing it would break a working deployment.
+// The upstream half is fenced in internal/engine/whatsmeow/upstream_test.go.
+func refuseAnUnreachableVersionTable(ctx context.Context, db *sql.DB) error {
+	var (
+		schemas    sql.NullString
+		reachable  bool
+		searchPath string
+	)
+	err := db.QueryRowContext(ctx, `SELECT
+		(SELECT string_agg(DISTINCT table_schema, ', ') FROM information_schema.tables WHERE table_name = $1),
+		to_regclass($1) IS NOT NULL,
+		current_setting('search_path')`, whatsmeowVersionTable).Scan(&schemas, &reachable, &searchPath)
+	if err != nil {
+		return fmt.Errorf("store: look for %s: %w", whatsmeowVersionTable, err)
+	}
+	if !schemas.Valid || reachable {
+		return nil
+	}
+	return fmt.Errorf("store: %s is in schema %s, which this connection's search_path (%s) "+
+		"does not reach, and whatsmeow's upgrade would take it for this connector's own and "+
+		"then fail to read it: give the connector a database of its own, or a search_path "+
+		"that includes the schema its tables are in", whatsmeowVersionTable, schemas.String, searchPath)
+}
+
+// ownTable stands for the tables this package creates, which are created together: the one
+// whose schema says where the rest of them are.
+const ownTable = "wac_session_device"
+
+// refuseASplitAcrossSchemas stops a start that would leave the store's tables in two
+// schemas, reading half of them from one and half from the other.
+//
+// Every table here and in whatsmeow is named bare, so a new one goes into the first
+// schema of `search_path` that exists (`current_schema()`), and `CREATE TABLE IF NOT
+// EXISTS` only looks there. With another schema put in front of the one holding the
+// tables, a start created an empty second set in it and read from that: a paired account
+// came back unbound and unwanted, and the next connect paired it again while its device
+// was still in the schema behind (#331). The same holds the other way round, the
+// connector's tables behind whatsmeow's, which is why both are asked about.
+//
+// Only a table the path does reach is compared: one it does not reach at all is either
+// #278's case, refused above, or a neighbour this connector never reads. And only one the
+// role holds some privilege on, the filter `information_schema` applies and the reason
+// whatsmeow's upgrade does not see the rest: a role with a schema of its own in front of
+// `public` can see another role's tables there by name, cannot use them, and builds its
+// own store where it creates, which works and is not a split.
+func refuseASplitAcrossSchemas(ctx context.Context, db *sql.DB) error {
+	var (
+		current, searchPath string
+		found               [2]sql.NullString
+	)
+	const schemaOf = `(SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE c.oid = to_regclass(%[1]s)
+			AND has_table_privilege(to_regclass(%[1]s), 'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER'))`
+	query := `SELECT COALESCE(current_schema(), ''), current_setting('search_path'), ` +
+		fmt.Sprintf(schemaOf, "$1") + `, ` + fmt.Sprintf(schemaOf, "$2")
+	tables := [2]string{whatsmeowVersionTable, ownTable}
+	err := db.QueryRowContext(ctx, query, tables[0], tables[1]).Scan(&current, &searchPath, &found[0], &found[1])
+	if err != nil {
+		return fmt.Errorf("store: look for %s and %s: %w", tables[0], tables[1], err)
+	}
+	for i, at := range found {
+		if !at.Valid || at.String == current {
+			continue
+		}
+		// Where the whole store is, if anywhere: that is the schema to put first. With each
+		// half in a schema of its own there is none, and reordering the path would only move
+		// the refusal from one table to the other.
+		var home sql.NullString
+		err := db.QueryRowContext(ctx, `SELECT string_agg(a.table_schema, ', ')
+			FROM information_schema.tables a JOIN information_schema.tables b ON b.table_schema = a.table_schema
+			WHERE a.table_name = $1 AND b.table_name = $2`, tables[0], tables[1]).Scan(&home)
+		if err != nil {
+			return fmt.Errorf("store: look for a schema holding both %s and %s: %w", tables[0], tables[1], err)
+		}
+		mend := "move the store into one schema"
+		if home.Valid {
+			mend = "put " + home.String + " first in the search_path"
+		}
+		return fmt.Errorf("store: %s is in schema %s, but this connection's search_path (%s) "+
+			"creates tables in %s, so the store would be split across the two and what is in "+
+			"%s left unread: %s, or give the connector a database of its own",
+			tables[i], at.String, searchPath, current, at.String, mend)
+	}
+	return nil
+}
+
+// idleConnLifetime is how long an unused connection is kept. Long enough that a quiet
+// minute does not cost a reconnect, short enough that an instance that went idle gives
+// its share of the server's connections back.
+const idleConnLifetime = 5 * time.Minute
+
+// Ping reports whether the database is answering. Readiness asks, because a session
+// cannot be opened or paired without it.
+func (c *Container) Ping(ctx context.Context) error {
+	if err := c.db.PingContext(ctx); err != nil {
+		return fmt.Errorf("store: ping: %w", err)
+	}
+	return nil
+}
+
+// DB is the pool, for the tests that have to look at the schema itself. Nothing in the
+// connector reaches for it: everything else goes through the methods above.
+func (c *Container) DB() *sql.DB { return c.db }
+
+// Devices is whatsmeow's own store. Nothing in the connector reaches for it any more --
+// a session gets its device from Device, which fences it -- and what comes out of here
+// does not stand behind any fence, so a caller that saves a device through this container
+// rather than through the device itself takes the fence off it.
+func (c *Container) Devices() *sqlstore.Container { return c.devices }
+
+// Close releases the pool. There is only one, and whatsmeow's container wraps it
+// rather than owning it, so closing it here is the whole of it.
+func (c *Container) Close() error {
+	return c.db.Close()
+}
+
+// Device returns the device a session should connect with: the stored one when that
+// session has paired before, and a fresh unpaired one otherwise.
+//
+// A mapping that points at a device whatsmeow no longer holds is treated as no mapping
+// at all: the credentials are what makes a session resumable, and without them the
+// only honest answer is to pair again.
+//
+// The fence is taken rather than applied by the caller so that there is no way to get a
+// device from here without one. A session builds a device more than once -- a logout and
+// a stale mapping both send it back for another -- and the second of those was where an
+// unfenced one first got in.
+func (c *Container) device(ctx context.Context, sid string, fence *Fence) (*store.Device, error) {
+	jid, bound, err := c.lookup(ctx, sid)
+	if err != nil {
+		return nil, err
+	}
+	if !bound {
+		return Fenced(c.devices.NewDevice(), fence), nil
+	}
+
+	device, err := c.devices.GetDevice(ctx, jid)
+	if err != nil {
+		return nil, fmt.Errorf("store: read the device of %s: %w", sid, err)
+	}
+	if device == nil {
+		// The mapping points at a device whatsmeow does not hold, and clearing it is a
+		// write -- the one write on a path that otherwise reads. Fenced like any other,
+		// and for a sharper reason than most: Bind runs before the device is saved, so a
+		// session that took this one over has a moment where its mapping is exactly this
+		// shape. Cleared by the instance on its way out, the new owner's device is left
+		// with nothing pointing at it.
+		if err := fence.held(); err != nil {
+			return nil, err
+		}
+		if err := c.unbind(ctx, sid); err != nil {
+			return nil, err
+		}
+		return Fenced(c.devices.NewDevice(), fence), nil
+	}
+	return Fenced(device, fence), nil
+}
+
+// Bind records which device a session paired.
+//
+// It is called from the pairing callback, before whatsmeow writes the device, so a
+// process that dies mid-pairing leaves a mapping to a device that does not exist yet,
+// which Device treats as unpaired. The other order would leave a stored device no
+// session claims, which nothing can clean up because nothing knows whose it was.
+//
+// The JID is stored exactly as WhatsApp issued it, device part included, because that
+// is the key whatsmeow files the device under and the one `GetDevice` answers to.
+// Normalising it away would leave every restart looking up a device that is there
+// under a name we no longer hold, reading it as unpaired, and pairing again.
+func (c *Container) bind(ctx context.Context, sid string, jid types.JID) error {
+	if sid == "" {
+		return errors.New("store: bind needs a session id")
+	}
+	if jid.IsEmpty() {
+		return fmt.Errorf("store: bind %s needs a jid", sid)
+	}
+
+	// An account belongs to one session, and re-pairing it issues a new device rather
+	// than reusing the old one, so the match is on the account and not on the device.
+	displaced, err := c.displacedBy(ctx, sid, jid.User)
+	if err != nil {
+		return err
+	}
+
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("store: bind %s: %w", sid, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx, c.rebind(`DELETE FROM wac_session_device WHERE account = ? AND sid <> ?`),
+		jid.User, sid); err != nil {
+		return fmt.Errorf("store: bind %s: %w", sid, err)
+	}
+	// Dropped before the bond is rewritten, and only when the device on it changes. The
+	// row above is updated rather than replaced when a session pairs again, so the
+	// cascade that clears this on a forget does not fire here -- and an availability the
+	// previous account's client asked for would be put back on the wire for an account
+	// that never asked, which is the one thing this record must not do.
+	if _, err := tx.ExecContext(ctx, c.rebind(`
+		DELETE FROM wac_session_presence WHERE sid = ? AND EXISTS (
+			SELECT 1 FROM wac_session_device WHERE sid = ? AND jid <> ?)`),
+		sid, sid, jid.String()); err != nil {
+		return fmt.Errorf("store: bind %s: %w", sid, err)
+	}
+	// And the names, for the same reason and with the same shape. A name kept here is one
+	// account's own, held against rows filed under that account's addresses; carried into a
+	// pairing with different addresses it is a name nothing here has any claim to, waiting
+	// for rows whose value could match by being empty.
+	if _, err := tx.ExecContext(ctx, c.rebind(`
+		DELETE FROM wac_own_name WHERE sid = ? AND EXISTS (
+			SELECT 1 FROM wac_session_device WHERE sid = ? AND jid <> ?)`),
+		sid, sid, jid.String()); err != nil {
+		return fmt.Errorf("store: bind %s: %w", sid, err)
+	}
+	// And the files this account sent, whose keys and chats are the previous account's:
+	// an edit under the new pairing must not be built out of one of them.
+	if _, err := tx.ExecContext(ctx, c.rebind(`
+		DELETE FROM wac_sent_media WHERE sid = ? AND EXISTS (
+			SELECT 1 FROM wac_session_device WHERE sid = ? AND jid <> ?)`),
+		sid, sid, jid.String()); err != nil {
+		return fmt.Errorf("store: bind %s: %w", sid, err)
+	}
+	// And the history dumps, which the device's own writes are already held to: a row is
+	// only ever written for the device the session is bound to, and this is the bond
+	// changing, so what the previous device left is the previous account's.
+	if _, err := tx.ExecContext(ctx, c.rebind(`
+		DELETE FROM wac_pending_history WHERE sid = ? AND device_jid <> ?`),
+		sid, jid.String()); err != nil {
+		return fmt.Errorf("store: bind %s: %w", sid, err)
+	}
+	if _, err := tx.ExecContext(ctx, c.rebind(`
+		INSERT INTO wac_session_device (sid, jid, account, bound_at) VALUES (?, ?, ?, ?)
+		ON CONFLICT (sid) DO UPDATE SET
+			jid = excluded.jid, account = excluded.account, bound_at = excluded.bound_at`),
+		sid, jid.String(), jid.User, time.Now().UnixMilli()); err != nil {
+		return fmt.Errorf("store: bind %s: %w", sid, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: bind %s: %w", sid, err)
+	}
+
+	// The devices the displaced mappings pointed at are credentials no session can reach
+	// any more, so they are deleted rather than left to accumulate. Failing the pairing
+	// over one that will not delete would be the worse outcome, so this is reported and
+	// not raised.
+	//
+	// What this does not do is end the displaced session. WhatsApp allows an account
+	// several companion devices, so pairing a second one does not unlink the first: if
+	// the displaced session is running somewhere, its socket goes on working against the
+	// account with credentials that are no longer written down, and it is only on the
+	// next restart that it finds itself unpaired. Ending it needs a session-scoped stop
+	// that reaches whichever instance runs it, which is the same fleet-wide machinery
+	// M2 brings for the write fence, and is tracked with it.
+	for _, old := range displaced {
+		c.deleteDevice(ctx, old)
+	}
+	return nil
+}
+
+// displacedBy lists the devices bound to an account under some other session.
+func (c *Container) displacedBy(ctx context.Context, sid, account string) ([]types.JID, error) {
+	rows, err := c.db.QueryContext(ctx,
+		c.rebind(`SELECT jid FROM wac_session_device WHERE account = ? AND sid <> ?`), account, sid)
+	if err != nil {
+		return nil, fmt.Errorf("store: read the mappings of %s: %w", account, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var displaced []types.JID
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			return nil, fmt.Errorf("store: read the mappings of %s: %w", account, err)
+		}
+		jid, err := types.ParseJID(raw)
+		if err != nil {
+			c.log.Warn().Str("sid", sid).Msg("a mapping holds an unreadable jid; leaving its device alone")
+			continue
+		}
+		displaced = append(displaced, jid)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: read the mappings of %s: %w", account, err)
+	}
+	return displaced, nil
+}
+
+func (c *Container) deleteDevice(ctx context.Context, jid types.JID) {
+	device, err := c.devices.GetDevice(ctx, jid)
+	if err != nil || device == nil {
+		if err != nil {
+			c.log.Warn().Err(err).Msg("failed to read a displaced device")
+		}
+		return
+	}
+	if err := c.devices.DeleteDevice(ctx, device); err != nil {
+		c.log.Warn().Err(err).Msg("failed to delete a displaced device")
+	}
+}
+
+// forget deletes a session's device and its mapping, and optionally what its client
+// asked for.
+//
+// The two are one function because the order matters and there is only one right one;
+// they are two doors on `Scoped` because the choice between them is not a detail a
+// caller should be able to skip. See the comment on `Scoped.ForgetCredentials`.
+func (c *Container) forget(ctx context.Context, sid string, alsoDesired bool) error {
+	jid, bound, err := c.lookup(ctx, sid)
+	if err != nil {
+		return err
+	}
+	if bound {
+		device, err := c.devices.GetDevice(ctx, jid)
+		if err != nil {
+			return fmt.Errorf("store: read the device of %s: %w", sid, err)
+		}
+		if device != nil {
+			if err := c.devices.DeleteDevice(ctx, device); err != nil {
+				return fmt.Errorf("store: delete the device of %s: %w", sid, err)
+			}
+		}
+	}
+	// The desired state goes by hand, because it has no foreign key to hang a cascade
+	// on: it is written before a session has a device, so it cannot reference one. Left
+	// behind, it would have the resume sweep trying to bring back an account whose
+	// credentials this call is deleting.
+	//
+	// And only when the caller means the request to be gone. A connect that finds its
+	// device unusable deletes it to build a replacement, and that is a repair: the
+	// client still wants this session connected, and dropping the row here would leave
+	// the account unresumable for exactly the reason #266 is about.
+	if alsoDesired {
+		if err := c.dropDesired(ctx, sid); err != nil {
+			return err
+		}
+	}
+	// The media parts go with the mapping, by the cascade on wac_media_part rather than
+	// by a delete here. An explicit one would only cover the case the constraint already
+	// covers -- foreign keys are on in both dialects, and whatsmeow refuses to bring its
+	// own schema up without them, so a store with them off does not boot at all -- and
+	// it would leave the case a delete cannot cover, which is a write already on its way
+	// when the mapping goes.
+	return c.unbind(ctx, sid)
+}
+
+// JID reports which device a session is bound to, and whether it is bound at all.
+func (c *Container) jid(ctx context.Context, sid string) (types.JID, bool, error) {
+	return c.lookup(ctx, sid)
+}
+
+func (c *Container) lookup(ctx context.Context, sid string) (types.JID, bool, error) {
+	var raw string
+	err := c.db.QueryRowContext(ctx, c.rebind(`SELECT jid FROM wac_session_device WHERE sid = ?`), sid).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return types.EmptyJID, false, nil
+	}
+	if err != nil {
+		return types.EmptyJID, false, fmt.Errorf("store: read the mapping of %s: %w", sid, err)
+	}
+
+	jid, err := types.ParseJID(raw)
+	if err != nil {
+		// A row we wrote that we cannot read back is corruption, not a missing pairing.
+		// Saying so is better than quietly asking the operator to scan a QR code.
+		return types.EmptyJID, false, fmt.Errorf("store: the mapping of %s holds an unreadable jid %q: %w", sid, raw, err)
+	}
+	return jid, true, nil
+}
+
+func (c *Container) unbind(ctx context.Context, sid string) error {
+	if _, err := c.db.ExecContext(ctx, c.rebind(`DELETE FROM wac_session_device WHERE sid = ?`), sid); err != nil {
+		return fmt.Errorf("store: drop the mapping of %s: %w", sid, err)
+	}
+	return nil
+}
+
+// migrate creates what this package owns. whatsmeow's own schema is brought up by
+// sqlstore.New, so this covers the mapping table and the media parts.
+//
+// The mapping table is brought up on its own and first, because the duplicates in it
+// have to be cleared out before the unique index that forbids them can be built.
+func (c *Container) migrate(ctx context.Context) error {
+	const mapping = `
+		CREATE TABLE IF NOT EXISTS wac_session_device (
+			sid      TEXT   PRIMARY KEY,
+			jid      TEXT   NOT NULL UNIQUE,
+			account  TEXT   NOT NULL,
+			bound_at BIGINT NOT NULL
+		)`
+	if _, err := c.db.ExecContext(ctx, mapping); err != nil {
+		return fmt.Errorf("store: create wac_session_device: %w", err)
+	}
+	if err := c.dropDuplicateMappings(ctx); err != nil {
+		return err
+	}
+
+	for _, statement := range []string{
+		// The account index was not unique to begin with, and `IF NOT EXISTS` on the
+		// same name is a no-op against a store that already has it: an upgraded database
+		// would keep the old one and never gain the constraint. Dropped by name and
+		// replaced under a new one, so the rename is what proves the new index exists.
+		`DROP INDEX IF EXISTS wac_session_device_account`,
+		// Unique, not just indexed. The rule is one session per account, and Bind
+		// enforced it by reading the competing mappings and then writing: two instances
+		// pairing the same number at once both read nothing, both write, and the account
+		// ends up on two sessions with the displacement never happening. A constraint is
+		// the only version of that check two transactions cannot both pass.
+		`CREATE UNIQUE INDEX IF NOT EXISTS wac_session_device_one_per_account ON wac_session_device (account)`,
+		// How to fetch a message's file a second time, for as long as the deployment is
+		// willing to. Keyed by the session as well as the message, because a message id
+		// is WhatsApp's to reuse across accounts and this table is read by whichever
+		// instance holds the session when the client comes back.
+		//
+		// Keys and digests are TEXT holding base64 rather than bytes: it is the same
+		// column in both dialects, and three fields of 32 bytes is not a size worth a
+		// difference in the schema for. `from_me` is a BIGINT for the same reason: a
+		// boolean is spelled differently in the two dialects and this table has held to
+		// one spelling throughout.
+		//
+		// `receipt_chat`, `sender` and `from_me` are not for the download -- that needs
+		// only the path, the key and the digests. They are the three things a request to
+		// upload the file again is addressed with, once WhatsApp has dropped it.
+		//
+		// `receipt_chat` is a column of its own and not the two beside it, and that is
+		// the point rather than duplication. `chat_kind` and `chat_id` are what the
+		// message was *published* under, and for a broadcast that is deliberately not
+		// where it was sent: WhatsApp shows such a message in the direct chat with
+		// whoever sent it, so the published chat is the sender and the list it came
+		// through is gone. A receipt addressed from that names a message WhatsApp cannot
+		// find.
+		//
+		// The foreign key is what makes a row impossible for a session that is not
+		// bound, and it is doing more than tidiness. Ownership moves between instances,
+		// so the old owner's handler can still be inside a write when the session has
+		// already been unpaired here: the delete finds nothing to take, the write lands
+		// afterwards as an insert, and a session that no longer exists is left holding
+		// the key to somebody's file until the retention sweep. No ordering argument
+		// closes that -- the constraint does, by refusing the parentless row outright.
+		`CREATE TABLE IF NOT EXISTS wac_media_part (
+			sid             TEXT   NOT NULL,
+			message_id      TEXT   NOT NULL,
+			chat_kind       TEXT   NOT NULL,
+			chat_id         TEXT   NOT NULL,
+			kind            TEXT   NOT NULL,
+			direct_path     TEXT   NOT NULL,
+			media_key       TEXT   NOT NULL,
+			file_enc_sha256 TEXT   NOT NULL,
+			file_sha256     TEXT   NOT NULL,
+			file_length     BIGINT NOT NULL,
+			mime            TEXT   NOT NULL,
+			filename        TEXT   NOT NULL,
+			receipt_chat    TEXT   NOT NULL DEFAULT '',
+			sender          TEXT   NOT NULL DEFAULT '',
+			from_me         BIGINT NOT NULL DEFAULT 0,
+			stored_at       BIGINT NOT NULL,
+			PRIMARY KEY (sid, message_id),
+			FOREIGN KEY (sid) REFERENCES wac_session_device (sid) ON DELETE CASCADE
+		)`,
+		// The sweep reads nothing but the clock, and it runs on a table with a row per
+		// media message the deployment ever received.
+		`CREATE INDEX IF NOT EXISTS wac_media_part_stored_at ON wac_media_part (stored_at)`,
+		// A bubble that has been scheduled and not yet decided. The decision lives in a
+		// timer, which lives as long as the process; the session it belongs to does not,
+		// so without this a deploy inside the window loses the bubble and the chat is
+		// left showing nothing at all.
+		//
+		// The same foreign key as above, for the same reason and with one more: this row
+		// is published to a client on behalf of a session, so a row that outlives the
+		// pairing would put a bubble in a chat the account no longer has.
+		//
+		// No retention sweep. Every row is deleted by whichever of its two endings comes
+		// first, and one that is left is one whose session has not been picked up yet --
+		// which is precisely the row that still has work to do. The cascade is what
+		// clears the rows of a session that is never coming back.
+		`CREATE TABLE IF NOT EXISTS wac_pending_placeholder (
+			sid        TEXT   NOT NULL,
+			message_id TEXT   NOT NULL,
+			message    TEXT   NOT NULL,
+			learned_at BIGINT NOT NULL,
+			due_at     BIGINT NOT NULL,
+			PRIMARY KEY (sid, message_id),
+			FOREIGN KEY (sid) REFERENCES wac_session_device (sid) ON DELETE CASCADE
+		)`,
+
+		// A history dump that was announced and not finished with. The phone announces a
+		// dump once and does not announce it again for a notification left unacknowledged,
+		// so this row is what a lost Redis, a lost lease or a restart in the middle of one
+		// leaves for the next attempt. The same cascade as the placeholder: a dump of an
+		// account that was logged out is one nobody should publish.
+		`CREATE TABLE IF NOT EXISTS wac_pending_history (
+			sid        TEXT   NOT NULL,
+			message_id TEXT   NOT NULL,
+			device_jid TEXT   NOT NULL,
+			notice     TEXT   NOT NULL,
+			learned_at BIGINT NOT NULL,
+			PRIMARY KEY (sid, message_id),
+			FOREIGN KEY (sid) REFERENCES wac_session_device (sid) ON DELETE CASCADE
+		)`,
+
+		// What a client asked this account to be shown as, so the first connection of a
+		// new owner can put it back the way a reconnect does. The session's own memory
+		// cannot: it is per instance, and a handoff builds one that has never heard the
+		// command.
+		//
+		// The cascade is the clearing rule. A forget unbinds the session and this goes
+		// with it, so what pairs next is available only if its own client says so.
+		// What a client asked for, which is the one thing nothing else in this schema
+		// records. `wac_session_device` says a session is paired; it does not say anybody
+		// wants it in the air, and adopting on the strength of a pairing would be the
+		// connector deciding to connect what no client asked for.
+		//
+		// It is what makes a session survive the instance that was running it. A lease is
+		// held by an instance and dies with it, a `session.wake` is a frame on a stream
+		// that is read once, and neither is a record of intent: after a restart the
+		// account is paired, unowned, and there is nothing anywhere that says it should be
+		// running -- which is exactly what fazer-ai/chatwoot#577 measured in production.
+		//
+		// No foreign key to the device, on purpose. A client connects a session before it
+		// has paired, so the row has to be writable while there is no device yet; what
+		// reads it joins the two, so a session that never paired is never resumed. A
+		// forget deletes it explicitly instead.
+		//
+		// `wants_groups` is not here, and that is deliberate: it is added below, by the
+		// same path that gives it to a store which predates it. Declared in both places
+		// it would have two defaults for one column -- a fresh store reading this one and
+		// an upgraded store reading the other -- and nothing would ever compare them.
+		`CREATE TABLE IF NOT EXISTS wac_session_desired (
+			sid      TEXT   PRIMARY KEY,
+			desired  TEXT   NOT NULL,
+			asked_at BIGINT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS wac_session_presence (
+			sid    TEXT   PRIMARY KEY,
+			state  TEXT   NOT NULL,
+			set_at BIGINT NOT NULL,
+			FOREIGN KEY (sid) REFERENCES wac_session_device (sid) ON DELETE CASCADE
+		)`,
+		// One row per display name of the account's own that did not reach the contact
+		// table. The table is the copy `contact.resolve` answers the account with, because
+		// every change reaches it; a write that failed is the one case where that is not
+		// true, and the session that saw the failure is the only thing that knew (#140).
+		//
+		// `held` is what every row was holding when the write failed, and it is what makes
+		// this answerable on the way back. "Which of these two copies is newer" is the
+		// question nothing on either side settles; "has anything written a name here since"
+		// is the same question asked where there is an answer. Every row and not just the
+		// one a read answers from, because the retry writes under every address.
+		//
+		// The same foreign key as the presence above, and for the same reason: the name is
+		// the pairing's, so a row that outlived the pairing would be answering for an
+		// account this device no longer is. No retention sweep either -- a row is deleted
+		// by whichever of its two endings comes first, and one that is left is one whose
+		// write still has not landed, which is precisely the row that still has work to do.
+		`CREATE TABLE IF NOT EXISTS wac_own_name (
+			sid       TEXT   NOT NULL,
+			kind      TEXT   NOT NULL,
+			name      TEXT   NOT NULL,
+			held      TEXT   NOT NULL,
+			marked_at BIGINT NOT NULL,
+			PRIMARY KEY (sid, kind),
+			FOREIGN KEY (sid) REFERENCES wac_session_device (sid) ON DELETE CASCADE
+		)`,
+		// One row per attempt at making a group: the intent, written before WhatsApp is
+		// asked, and the group it turned into, written after. The split is what covers the
+		// one effect this connector serves that a second run duplicates instead of
+		// converging on (#131).
+		//
+		// No foreign key to the device mapping, unlike the presence above. An attempt is
+		// about a command, not about a pairing, and a session that re-paired mid-flight
+		// still has a redelivery of that command to answer; cascading it away would take
+		// the only record of a group that exists.
+		`CREATE TABLE IF NOT EXISTS wac_group_create (
+			sid        TEXT   NOT NULL,
+			attempt    TEXT   NOT NULL,
+			create_key TEXT   NOT NULL,
+			subject    TEXT   NOT NULL,
+			started_at BIGINT NOT NULL,
+			group_jid  TEXT,
+			touched_at BIGINT NOT NULL,
+			PRIMARY KEY (sid, attempt)
+		)`,
+		// The key is how WhatsApp's own notification finds the attempt that sent it, which
+		// is a lookup by (sid, create_key) on every group this account is added to.
+		`CREATE INDEX IF NOT EXISTS wac_group_create_key ON wac_group_create (sid, create_key)`,
+		// The sweep goes by when an attempt was last written, across every session.
+		`CREATE INDEX IF NOT EXISTS wac_group_create_touched_at ON wac_group_create (touched_at)`,
+		// A media message this account sent, kept whole for as long as WhatsApp lets its
+		// caption be corrected (#32). An edit carries the corrected message in full, file
+		// coordinates included, and nothing else here remembers them once the send has
+		// answered; rebuilt without them the correction replaces the file with nothing.
+		//
+		// The same foreign key as the media parts: the row holds a file's key on behalf of
+		// a pairing, and it goes with the pairing.
+		`CREATE TABLE IF NOT EXISTS wac_sent_media (
+			sid        TEXT   NOT NULL,
+			message_id TEXT   NOT NULL,
+			chat       TEXT   NOT NULL,
+			body       TEXT   NOT NULL,
+			sent_at    BIGINT NOT NULL,
+			PRIMARY KEY (sid, message_id),
+			FOREIGN KEY (sid) REFERENCES wac_session_device (sid) ON DELETE CASCADE
+		)`,
+		// The sweep reads nothing but the clock.
+		`CREATE INDEX IF NOT EXISTS wac_sent_media_sent_at ON wac_sent_media (sent_at)`,
+	} {
+		if _, err := c.db.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("store: bring the connector's own schema up: %w", err)
+		}
+	}
+	// The columns a store that predates them does not have. `CREATE TABLE IF NOT EXISTS`
+	// above does nothing to a table that is already there, so a deployment upgrading into
+	// this would keep the old shape and every write would fail on the missing column.
+	//
+	// Added rather than the table recreated, because a deployment has rows in both: the
+	// media ones are what a client's `message.download_media` reads, and dropping them
+	// would lose the file of every message received before the upgrade; the desired ones
+	// are what brings a paired account back by itself, and dropping them would leave a
+	// fleet's whole roster on the floor until somebody pressed connect on each inbox.
+	//
+	// `wants_groups` defaults to 0, so a row written before this column existed resumes
+	// with group traffic off. That is the state the deployment is already in -- a resumed
+	// session has never carried the subscription -- and the other default would have an
+	// upgrade start publishing group conversation into inboxes on the strength of a
+	// request nobody recorded.
+	//
+	// `wants_call_auto_reject` defaults to 0 for the same reason and with the stronger
+	// case: a call this connector refuses is a call the operator's phone never rings for,
+	// so an upgrade that defaulted it on would start silently declining calls for every
+	// account on the deployment on the strength of a request nobody made.
+	//
+	// `wants_proxy` defaults to empty, a session that goes out directly, which is the only
+	// thing any session did before the column existed: the connect refused a proxy until
+	// #217, so no row written before it can stand for one.
+	//
+	// `wants_history` defaults to 0 on the same ground: the connect refused `history_sync`
+	// until #348, so no row written before the column can have asked for it.
+	//
+	// `wants_call_answer` defaults to 0 for the same reason: the connect had no
+	// `calls.answer` before #383.
+	//
+	// `rev` defaults to 0 and counts writes from there, so a row that predates it is a
+	// row nobody has written since -- which is true, and is the only thing a caller
+	// comparing against it needs.
+	//
+	// `alt_chat_kind` and `alt_chat_id` default to empty, a row published under one address
+	// only, which is every row written before a history dump could name a chat again.
+	//
+	// `blob_id` defaults to empty, which is a row with no file kept for it on this
+	// instance's disk. That is what every row in an upgrading deployment is, because the
+	// blobs predate the column that would have named them, and it is also what a row
+	// whose blob has been swept comes back to.
+	//
+	// `rev`, `blob_id` and the two `alt_chat_` columns are ones a fresh store does not have
+	// either, on purpose: the
+	// default belongs in one place, and this is the place that has to have it right for
+	// the store that already has rows.
+	for _, column := range []struct{ table, name, definition string }{
+		{"wac_media_part", "receipt_chat", "TEXT NOT NULL DEFAULT ''"},
+		{"wac_media_part", "sender", "TEXT NOT NULL DEFAULT ''"},
+		{"wac_media_part", "from_me", "BIGINT NOT NULL DEFAULT 0"},
+		{"wac_media_part", "blob_id", "TEXT NOT NULL DEFAULT ''"},
+		{"wac_media_part", "rev", "BIGINT NOT NULL DEFAULT 0"},
+		{"wac_media_part", "alt_chat_kind", "TEXT NOT NULL DEFAULT ''"},
+		{"wac_media_part", "alt_chat_id", "TEXT NOT NULL DEFAULT ''"},
+		{"wac_session_desired", "wants_groups", "BIGINT NOT NULL DEFAULT 0"},
+		{"wac_session_desired", "wants_call_auto_reject", "BIGINT NOT NULL DEFAULT 0"},
+		{"wac_session_desired", "wants_proxy", "TEXT NOT NULL DEFAULT ''"},
+		{"wac_session_desired", "wants_history", "BIGINT NOT NULL DEFAULT 0"},
+		{"wac_session_desired", "wants_call_answer", "BIGINT NOT NULL DEFAULT 0"},
+	} {
+		if err := c.addColumn(ctx, column.table, column.name, column.definition); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// addColumn adds one column to a table that may already have it.
+//
+// Asked rather than attempted, because the two dialects disagree about the attempt:
+// Postgres takes `ADD COLUMN IF NOT EXISTS` and SQLite does not, and SQLite's answer to
+// a column that is already there is an error indistinguishable by type from the ones
+// that matter. Asking first is one round trip on a path that runs once per process
+// start.
+//
+// And asked again if the attempt fails, because asking first is not a lock. Two
+// instances starting together -- which is what a rolling deploy is -- can both find the
+// column missing, and the one that loses gets a duplicate-column error for work the
+// other has already done. Re-reading is what tells "somebody beat me to it" from "this
+// did not happen", and the first of those is not a reason to refuse to start.
+func (c *Container) addColumn(ctx context.Context, table, column, definition string) error {
+	present, err := c.hasColumn(ctx, table, column)
+	if err != nil || present {
+		return err
+	}
+	if _, err := c.db.ExecContext(ctx, `ALTER TABLE `+table+` ADD COLUMN `+column+` `+definition); err != nil {
+		switch present, reread := c.hasColumn(ctx, table, column); {
+		case reread != nil:
+			return reread
+		case present:
+			return nil
+		}
+		return fmt.Errorf("store: add %s.%s: %w", table, column, err)
+	}
+	return nil
+}
+
+// hasColumn reports whether a table has a column, asking about the table this
+// connection's own statements would reach and no other.
+//
+// That qualification is the whole of the Postgres branch. `information_schema.columns`
+// filtered by table name alone spans every schema the role can see, so a copy of this
+// table in another schema -- an older one, a neighbour's -- answers for the one the
+// writes actually land in, and the column is reported present on a table that has not
+// got it. `to_regclass` resolves the name through `search_path` exactly the way the DML
+// does, so what is asked about is what is written to.
+func (c *Container) hasColumn(ctx context.Context, table, column string) (bool, error) {
+	query := `SELECT 1 FROM pragma_table_info(?) WHERE name = ?`
+	if c.dialect == dialectPostgres {
+		query = `SELECT 1 FROM pg_attribute
+			WHERE attrelid = to_regclass(?) AND attname = ? AND attnum > 0 AND NOT attisdropped`
+	}
+	var present int
+	switch err := c.db.QueryRowContext(ctx, c.rebind(query), table, column).Scan(&present); {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, sql.ErrNoRows):
+		return false, nil
+	default:
+		return false, fmt.Errorf("store: ask whether %s.%s is there: %w", table, column, err)
+	}
+}
+
+// dropDuplicateMappings clears out whatever the old, permissive account index let
+// through, so a unique one can be built over it.
+//
+// The rule was always one session per account, so a second mapping is a row that should
+// never have been written. Which one to keep is decided by the credentials and not by
+// the clock: Bind writes the mapping before whatsmeow writes the device, so an instance
+// that died mid-pairing leaves the newest mapping of all pointing at a device that never
+// existed. Keeping that one deletes a working device to preserve an empty row, Device
+// then unbinds the survivor for having no credentials, and an upgrade has made an
+// account that was paired pair again. So the winner is the most recent mapping whose
+// device is actually on disk, and only when none of them has one does it fall back to
+// the most recent outright, which is the best a set of empty rows allows.
+//
+// The devices the losers named go with them, the way Bind takes a displaced device: no
+// mapping can reach them afterwards, and leaving them is leaving authentication material
+// on disk that nothing will ever use or clean up.
+func (c *Container) dropDuplicateMappings(ctx context.Context) error {
+	const contested = `
+		SELECT sid, jid, account, bound_at FROM wac_session_device
+		WHERE account IN (
+			SELECT account FROM wac_session_device GROUP BY account HAVING COUNT(*) > 1
+		)`
+
+	rows, err := c.db.QueryContext(ctx, contested)
+	if err != nil {
+		return fmt.Errorf("store: find the mappings the old index allowed: %w", err)
+	}
+	type mapping struct {
+		sid      string
+		jid      types.JID
+		readable bool
+		boundAt  int64
+	}
+	byAccount := map[string][]mapping{}
+	for rows.Next() {
+		var sid, raw, account string
+		var boundAt int64
+		if err := rows.Scan(&sid, &raw, &account, &boundAt); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("store: read the mappings the old index allowed: %w", err)
+		}
+		held := mapping{sid: sid, boundAt: boundAt}
+		if jid, parseErr := types.ParseJID(raw); parseErr != nil {
+			c.log.Warn().Str("sid", sid).Msg("a duplicate mapping holds an unreadable jid; leaving its device alone")
+		} else {
+			held.jid, held.readable = jid, true
+		}
+		byAccount[account] = append(byAccount[account], held)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("store: read the mappings the old index allowed: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("store: read the mappings the old index allowed: %w", err)
+	}
+
+	var displaced []mapping
+	for _, candidates := range byAccount {
+		slices.SortFunc(candidates, func(a, b mapping) int {
+			if a.boundAt != b.boundAt {
+				return cmp.Compare(b.boundAt, a.boundAt)
+			}
+			return cmp.Compare(b.sid, a.sid)
+		})
+		// Newest first, so the first one holding credentials is both the most recent
+		// mapping and a usable one. Zero is the fallback the loop leaves standing.
+		winner := 0
+		for i, candidate := range candidates {
+			if !candidate.readable {
+				continue
+			}
+			held, err := c.hasDevice(ctx, candidate.jid)
+			if err != nil {
+				// Not "no credentials". A lookup that failed says nothing about what is
+				// on disk, and reading it as absence is how the mapping that has the
+				// device becomes a loser and gets deleted — the very thing this rule
+				// exists to prevent. The duplicates keep for another start; the unique
+				// index this precedes will not be built either, so nothing here is
+				// half-done.
+				return fmt.Errorf("store: read the device of %s: %w", candidate.sid, err)
+			}
+			if held {
+				winner = i
+				break
+			}
+		}
+		for i, candidate := range candidates {
+			if i != winner {
+				displaced = append(displaced, candidate)
+			}
+		}
+	}
+	if len(displaced) == 0 {
+		return nil
+	}
+
+	for _, old := range displaced {
+		if _, err := c.db.ExecContext(ctx,
+			c.rebind(`DELETE FROM wac_session_device WHERE sid = ?`), old.sid); err != nil {
+			return fmt.Errorf("store: drop the mapping of %s: %w", old.sid, err)
+		}
+		if old.readable {
+			c.deleteDevice(ctx, old.jid)
+		}
+	}
+	c.log.Warn().Int("dropped", len(displaced)).
+		Msg("more than one session held the same account; the losing mappings and their devices are gone")
+	return nil
+}
+
+// hasDevice reports whether whatsmeow still holds the credentials a mapping names. The
+// error is returned rather than folded into the answer, because "there is no device" and
+// "this could not be read" are the same value and opposite facts: one is a row to drop,
+// the other is a question nobody has answered.
+func (c *Container) hasDevice(ctx context.Context, jid types.JID) (bool, error) {
+	device, err := c.devices.GetDevice(ctx, jid)
+	if err != nil {
+		return false, err
+	}
+	return device != nil, nil
+}
+
+// rebind turns `?` placeholders into `$1`-style ones for Postgres. Writing every
+// statement once and translating here is the smaller of the two evils: the alternative
+// is two copies of each query, which drift.
+func (c *Container) rebind(query string) string {
+	if c.dialect != dialectPostgres {
+		return query
+	}
+	var out strings.Builder
+	out.Grow(len(query) + 8)
+	n := 0
+	for i := range len(query) {
+		if query[i] != '?' {
+			out.WriteByte(query[i])
+			continue
+		}
+		n++
+		out.WriteByte('$')
+		out.WriteString(strconv.Itoa(n))
+	}
+	return out.String()
+}
+
+const (
+	dialectPostgres = "postgres"
+	dialectSQLite   = "sqlite"
+)
+
+// parseURL splits a database url into the dialect and the dsn the driver wants.
+func parseURL(address string) (dialect, dsn string, err error) {
+	switch {
+	case address == "":
+		return "", "", ErrNoDatabase
+	case strings.HasPrefix(address, "postgres://"), strings.HasPrefix(address, "postgresql://"):
+		return dialectPostgres, address, nil
+	case strings.HasPrefix(address, "file:"):
+		return dialectSQLite, sqliteDefaults(address), nil
+	case strings.HasPrefix(address, "sqlite://"):
+		return dialectSQLite, sqliteDefaults("file:" + strings.TrimPrefix(address, "sqlite://")), nil
+	case strings.HasPrefix(address, "sqlite:"):
+		return dialectSQLite, sqliteDefaults("file:" + strings.TrimPrefix(address, "sqlite:")), nil
+	default:
+		return "", "", fmt.Errorf("store: %q is not a database url this connector understands", address)
+	}
+}
+
+// sqliteDefaults fills in what the driver leaves off and whatsmeow needs on. An
+// operator who spells any of these themselves keeps their value; the defaults are for
+// the url the README documents, which is a path and nothing else.
+//
+// Each one is here because of a failure, not a preference:
+//
+//   - foreign_keys: whatsmeow refuses to bring its schema up without it, so first boot
+//     dies on `foreign keys are not enabled`.
+//   - journal_mode(WAL): the default rollback journal blocks every reader for the
+//     length of a write, and whatsmeow reads on the decrypt path while it writes on the
+//     receipt path.
+//   - busy_timeout: without it a contended write returns `database is locked` on the
+//     spot instead of waiting. That is what a live pairing produced: identity keys that
+//     could not be saved, messages that then could not be decrypted, and an app state
+//     sync that failed because the key share it needed was inside one of them. What is
+//     spelled here is the value a call with no deadline of its own gets; a call that
+//     carries one waits on that instead (`sqlitebudget.go`, #293).
+//   - _txlock=immediate: a transaction that starts out reading and later writes has to
+//     upgrade its lock, and two of those upgrading at once is a deadlock SQLite breaks
+//     by failing one of them, which no timeout can save. Taking the write lock at BEGIN
+//     turns that into ordinary waiting.
+func sqliteDefaults(dsn string) string {
+	base, query, _ := strings.Cut(dsn, "?")
+	values, err := url.ParseQuery(query)
+	if err != nil {
+		// An unparseable query is the operator's to fix, and rewriting it here would
+		// hide which half they got wrong.
+		return dsn
+	}
+
+	for pragma, setting := range map[string]string{
+		"foreign_keys": "foreign_keys(1)",
+		"journal_mode": "journal_mode(WAL)",
+		"busy_timeout": "busy_timeout(10000)",
+	} {
+		if !hasPragma(values["_pragma"], pragma) {
+			values.Add("_pragma", setting)
+		}
+	}
+	if values.Get("_txlock") == "" {
+		values.Set("_txlock", "immediate")
+	}
+	return base + "?" + values.Encode()
+}
+
+// hasPragma reports whether the operator already set one, whatever they set it to.
+func hasPragma(pragmas []string, name string) bool {
+	for _, pragma := range pragmas {
+		if strings.HasPrefix(strings.TrimSpace(pragma), name) {
+			return true
+		}
+	}
+	return false
+}

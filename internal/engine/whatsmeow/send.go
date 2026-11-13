@@ -1,0 +1,546 @@
+package whatsmeow
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	wm "go.mau.fi/whatsmeow"
+	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
+	waTypes "go.mau.fi/whatsmeow/types"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+	"github.com/fazer-ai/whatsapp-connector/internal/store"
+)
+
+// sendRequest is `message.send`, decoded.
+//
+// The caller names the message. That is what makes a send idempotent: a command this
+// connector already carried out and could not acknowledge is redelivered with the same
+// id, goes out under the same id, and the recipient's own client shows one message
+// rather than two. Generating an id here would turn every lost acknowledgement into a
+// duplicate in somebody's conversation.
+type sendRequest struct {
+	MessageID string           `json:"message_id"`
+	To        protocol.Address `json:"to"`
+	Content   json.RawMessage  `json:"content"`
+	Quoted    *struct {
+		ID          string            `json:"id"`
+		Participant *protocol.Address `json:"participant"`
+		FromMe      bool              `json:"from_me"`
+	} `json:"quoted"`
+	Mentions  []protocol.Address `json:"mentions"`
+	Ephemeral uint32             `json:"ephemeral"`
+	ClientRef *string            `json:"client_ref"`
+}
+
+// jidOf is the way back from a canonical address to the JID WhatsApp is addressed by.
+// Refusing what it cannot build matters as much as building the rest: a bad server
+// guessed at here is a message delivered to somebody the caller did not name.
+func jidOf(address protocol.Address) (waTypes.JID, error) {
+	if address.ID == "" {
+		return waTypes.EmptyJID, protocol.NewError(protocol.ErrorInvalidPayload, "an address with no id names nobody")
+	}
+	switch address.Kind {
+	case protocol.AddressPhone:
+		return waTypes.NewJID(address.ID, waTypes.DefaultUserServer), nil
+	case protocol.AddressLID:
+		return waTypes.NewJID(address.ID, waTypes.HiddenUserServer), nil
+	case protocol.AddressGroup:
+		return waTypes.NewJID(address.ID, waTypes.GroupServer), nil
+	case protocol.AddressNewsletter:
+		return waTypes.NewJID(address.ID, waTypes.NewsletterServer), nil
+	case protocol.AddressBroadcast, protocol.AddressStatus:
+		return waTypes.NewJID(address.ID, waTypes.BroadcastServer), nil
+	default:
+		return waTypes.EmptyJID, protocol.NewError(protocol.ErrorInvalidPayload,
+			fmt.Sprintf("%q is not an address kind this connector knows", address.Kind))
+	}
+}
+
+// send carries out `message.send` and answers the result the contract's table names.
+func (s *Session) send(ctx context.Context, command *protocol.Command) (json.RawMessage, error) {
+	var req sendRequest
+	if err := json.Unmarshal(command.Payload, &req); err != nil {
+		return nil, protocol.NewError(protocol.ErrorInvalidPayload, "a send has to say what to send and to whom")
+	}
+	if req.MessageID == "" {
+		return nil, protocol.NewError(protocol.ErrorInvalidPayload, "a send has to name the message it is sending")
+	}
+	to, err := jidOf(req.To)
+	if err != nil {
+		return nil, err
+	}
+
+	// Built before the session's own state is checked, and that order is deliberate: a
+	// payload this connector can never send is the caller's bug whatever the socket is
+	// doing, and answering `not_connected` to one sends it away to wait for a
+	// connection that would not have helped.
+	alongside, err := contextToSend(&req, s.ownJID(to), to)
+	if err != nil {
+		return nil, err
+	}
+	message, plan, err := planBody(&req, alongside, s.sendLimit)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := s.readyToSend(); err != nil {
+		return nil, err
+	}
+
+	if plan != nil {
+		// The half of the body that needs the network, and the only reason the two are
+		// split: fetching a file and uploading it is work worth spending on a session
+		// that can actually send, and everything above was refused before the socket was
+		// consulted at all.
+		building, cancel := context.WithTimeout(ctx, s.uploadWait)
+		defer cancel()
+		if message, err = s.mediaToSend(building, plan, alongside); err != nil {
+			return nil, err
+		}
+		if err := s.keepForItsCaption(ctx, to, req.MessageID, message); err != nil {
+			return nil, err
+		}
+	}
+
+	sent, err := s.putOnTheWire(ctx, to, req.MessageID, message)
+	if err != nil {
+		return nil, err
+	}
+
+	return json.Marshal(map[string]any{
+		"message_id": sent.ID,
+		"timestamp":  sent.Timestamp.UnixMilli(),
+		"client_ref": req.ClientRef,
+	})
+}
+
+// keepForItsCaption keeps a media message as it is about to go out, so its caption can be
+// corrected later (#32). An edit carries the corrected message in full, and the file's
+// coordinates exist only in this message once the upload has answered.
+//
+// Kept before the send rather than after it: a process that dies between the two has
+// still sent the file, and the caption it went out with is still somebody's to correct.
+// A row for a send that then fails costs nothing an edit can reach, because WhatsApp
+// refuses an edit of a message it never took.
+//
+// A failure refuses the send. Without the record a later edit of this message cannot tell
+// it is a file and goes out as text, which WhatsApp ignores while the client is told the
+// caption changed: the store that would not take a note is a store a redelivery of the
+// send can try again, and a correction reported as done and never shown is not something
+// the client can find out about.
+func (s *Session) keepForItsCaption(ctx context.Context, to waTypes.JID, messageID string, message *waE2E.Message) error {
+	body, err := proto.Marshal(message)
+	if err != nil {
+		return fmt.Errorf("encode the media message %s to keep it: %w", messageID, err)
+	}
+	writing, written := context.WithTimeout(ctx, s.storeLimit)
+	defer written()
+	if err := s.store.PutSentMedia(writing, messageID, store.SentMedia{Chat: to.String(), Body: body}); err != nil {
+		return fmt.Errorf("keep the media message %s for its caption to be corrected: %w", messageID, err)
+	}
+	return nil
+}
+
+// readyToSend refuses a session that cannot put anything on the wire, and the order of
+// the two questions is the answer to a different one each.
+func (s *Session) readyToSend() error {
+	if phone, _ := s.identity(); phone == "" {
+		// Asked before the socket, because an unpaired session is never connected and
+		// the two answers send a client down different roads: one pairs an account, the
+		// other waits for a connection to come back. Answering `not_connected` to a
+		// session that has no account leaves it waiting for something nothing is going
+		// to do.
+		return protocol.NewError(protocol.ErrorNotPaired, "this session has no WhatsApp account to send from")
+	}
+	if s.state() != "open" {
+		// The session's own state, not whatsmeow's. IsConnected takes the socket lock,
+		// which a dial holds for its whole handshake, so a send that arrived during a
+		// resume would wait there without watching its own deadline and hold the
+		// session's queue behind it. It also goes true when the websocket opens and
+		// before the account is authenticated, which is a send onto a stream WhatsApp
+		// has not accepted yet.
+		return protocol.NewError(protocol.ErrorNotConnected, "the session is not connected to WhatsApp")
+	}
+	return nil
+}
+
+// putOnTheWire hands a built message to WhatsApp under the id the caller named.
+//
+// The id is the caller's on purpose: WhatsApp uses it as the stanza id, so a message that
+// went out and lost its reply can be sent again under the same one and the receiving
+// client discards the second copy. That is the one retry that cannot duplicate anything,
+// and it is why every command that creates a message carries an id of its own.
+//
+// The discarding is the receiving client's, and WhatsApp's part in this is only lending
+// the id: a resend under an id WhatsApp has already seen is delivered again, in full,
+// however long ago the first one went -- measured from an immediate resend out to thirty
+// minutes, direct and group alike (#215). What makes the retry safe is that every client
+// downstream drops the repeat, which is the same property the inbound path here already
+// spends, and which `contract/PROTOCOL.md` now asks of a client in so many words.
+//
+// Four commands come through here, not one: `message.send` names its own id, and
+// `message.edit`, `message.revoke` and `message.react` take one from `orDerived`, which
+// falls back to the `idempotency_key` or the command's id. So the ceiling below reaches
+// all four, and the safety argument above covers all four with it -- each resend names a
+// message the receiving side already holds. `orDerived` has one case that does not, a
+// command carrying neither key nor id, and the schema makes that unreachable for a
+// conforming client by requiring `id` on every command frame.
+func (s *Session) putOnTheWire(
+	ctx context.Context, to waTypes.JID, messageID string, message *waE2E.Message,
+) (wm.SendResponse, error) {
+	// Bounded here rather than inside `overSocket`, and the reason is the seam one line
+	// down: `handOver` replaces `overSocket` whole, so a ceiling built in there is one no
+	// test that uses the seam can see. #283 is about a wait nothing ends, and a fence
+	// nothing can observe would be the same defect wearing a fix.
+	wire, giveUp := context.WithTimeoutCause(ctx, s.wireLimit, errSendCeiling)
+	defer giveUp()
+
+	hand := s.handOver
+	if hand == nil {
+		hand = s.overSocket
+	}
+	done, err := s.takeTurnToSend(wire)
+	if err != nil {
+		return wm.SendResponse{}, sendFailure(whichClockRanOut(wire, err))
+	}
+	defer done()
+	sent, err := hand(wire, to, messageID, message)
+	if err != nil {
+		return wm.SendResponse{}, sendFailure(whichClockRanOut(wire, err))
+	}
+	return sent, nil
+}
+
+// takeTurnToSend waits for this session's turn to send a message, under ctx, and returns
+// what gives the turn back.
+//
+// whatsmeow sends one message at a time behind a mutex that reads no context, so a send
+// waiting on another would outlive its own deadline and hold the session's command queue
+// with it. The command sends already go one at a time through the executor; what they can
+// land behind is the request for history a dump sends by itself, off the executor. Taking
+// the turn here first makes that wait one the caller's deadline ends, and costs nothing in
+// concurrency the library was not already refusing.
+func (s *Session) takeTurnToSend(ctx context.Context) (func(), error) {
+	select {
+	case s.sending <- struct{}{}:
+		return func() { <-s.sending }, nil
+	case <-ctx.Done():
+		// The error a send cut short returns, so the caller tells the clocks apart the
+		// same way.
+		return nil, ctx.Err()
+	}
+}
+
+// errSendCeiling is what `wire` is cancelled with when this connector's own ceiling is
+// the thing that ended a send. It is never returned on its own: it names a cause, and
+// what a caller gets is still the contract's `timeout`.
+var errSendCeiling = errors.New("this connector's ceiling on one send ended it")
+
+// whichClockRanOut names the clock that ended a send.
+//
+// Three clocks can end one and two of them are this connector's: the caller's own
+// `deadline` or `max_runtime_ms`, and `wireLimit`. Those two produce the same
+// `context.DeadlineExceeded` -- not an equal value, the same one -- so nothing that only
+// sees the error can tell them apart, and #291 is about an operator who had to subtract
+// two timestamps by hand to find out which. The third is the library's own answer
+// running out, which arrives as its own sentinel and needs nothing from this.
+//
+// The answer comes from `context.Cause`, and not from asking each context whether it is
+// done, because those are different questions. `Cause` is written once, by whichever
+// cancellation actually happened, and it does not change afterwards; the done-ness of a
+// context is read now and says nothing about the order. The difference is reachable: a
+// send can sit inside the library long past its ceiling, on waits nothing interrupts
+// (#290 and #74), and a caller that gives up during that window would have been read as
+// the one that ended it. Measured: with `wire` expired on its own ceiling and the parent
+// cancelled afterwards, `context.Cause(wire)` is still this connector's while the parent
+// already reports `context.Canceled`.
+//
+// A caller's shorter deadline propagates instead, because `WithTimeoutCause` on a parent
+// that is closer to its own deadline is a plain cancellation of that parent, cause and
+// all. So the default branch is the caller's, and it covers a cause the caller set as
+// well as the bare context errors.
+func whichClockRanOut(wire context.Context, err error) error {
+	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		return err
+	}
+	switch cause := context.Cause(wire); {
+	case cause == nil:
+		// Neither of ours: the library reached a deadline of its own inside a context
+		// that is still live. Left as it came, because it already says which.
+		return err
+	case errors.Is(cause, errSendCeiling):
+		return fmt.Errorf("%w: %w", errSendCeiling, err)
+	default:
+		return fmt.Errorf("the command's own context ended this send: %w", err)
+	}
+}
+
+// sendCeiling is how long this connector lets one send run, and it exists because
+// whatsmeow does not bound the half of it that matters. A send interrupted by the
+// connection dropping is retried once, and that retry is handed a zero timeout
+// (`send.go` and `sendfb.go` in the pinned library, both calling `retryFrame` with `0`),
+// where zero does not mean the default: the timer is built only `if timeout > 0`, so the
+// retry waits on the answer and on the context, and on nothing else. Tracked as #283,
+// and `upstream_test.go` fails when any of that changes shape.
+//
+// The number is the sum of the bounded stages that can run inside this one call, not a
+// figure picked for feeling right, because the context handed to `SendMessage` covers far
+// more than the wait for the acknowledgement. Reading the pinned library, one send waits
+// on four things in turn:
+//
+//   - the group metadata query OR the LID fetch, never both: they are the two arms of the
+//     same `else if` on the destination's server, so a group send pays the first and a
+//     direct send pays the second;
+//   - the device list query, which every send pays;
+//   - the prekey fetch, for a recipient this session has no session with;
+//   - the acknowledgement for the send itself.
+//
+// And each of those four is attempted twice, not once, which is what the first version of
+// this derivation missed and review caught. A disconnect under any of them produces a
+// disconnect node rather than an answer, and the library reacts by waiting up to five
+// seconds for the socket to come back and then sending the same frame again. So a stage
+// costs a wait, a reconnect window, and a second wait of the same size.
+//
+//	4 stages * (75s + 5s + 75s) = 620s
+//
+// Where the two halves of a stage differ is only in who grants the second wait. For the
+// three info queries the library passes its own `query.Timeout` down to `retryFrame`, so
+// both attempts are its seventy five seconds. For the acknowledgement it passes zero, and
+// that is the whole of #283: the retry of a send has no timer upstream at all, and the
+// seventy five seconds counted for it here is a budget this connector grants it, chosen to
+// be the same one the first attempt had rather than discovered somewhere.
+//
+// Adding a stage to that list means adding it here. What the sum deliberately does not
+// contain is the media upload, which is bounded separately and earlier, inside the build,
+// by `uploadTimeout`; by the time a message reaches the wire its bytes are already up.
+//
+// And what no number here reaches: three waits inside this region do not look at the
+// context at all. `SendMessage` takes `cli.messageSendLock` before it does anything;
+// `NoiseSocket.SendFrame` takes its write lock before reading the context, which is #74;
+// and `sendNodeAndGetData` and `retryFrame` both take `cli.socketLock.RLock()` to read
+// the socket, against a `connect()` that holds the write half for the length of a dial
+// and a handshake. That third one is the one worth naming here rather than counting as
+// more of the same: `autoReconnect` calls exactly that `connect()`, so it is held
+// precisely during the reconnection this ceiling exists to survive. Three is what has
+// been found, not what is there: an exhaustive count of this shape has turned out wrong
+// twice already, which is why `contract/PROTOCOL.md` no longer publishes one.
+// A send held by any of them does not come back when this ceiling runs out, and the ones
+// queued behind it are not ended by it either: `bound` in the session layer starts a
+// `max_runtime_ms` budget when a command begins, not when it arrives, so a command that
+// waited its turn begins with a full one. What the ceiling buys the queue is that the
+// held call returns the moment it is released, instead of spending what is left of a
+// reply nobody is bringing, which is the whole of what it buys. The queue wait does spend this budget, since the deadline is set before
+// the call and the lock is taken inside it, but in this connector one client belongs to
+// one session and the session executor already runs sends one at a time, so the only
+// contention left is whatsmeow's own short internal sends.
+const sendCeiling = 4 * (2*upstreamRequestWait + upstreamReconnectWait)
+
+// upstreamRequestWait and upstreamReconnectWait are the pinned library's own numbers,
+// named here so the arithmetic above reads as a derivation rather than a guess.
+// `defaultRequestTimeout` and the `WaitForConnection` call inside `retryFrame`.
+const (
+	upstreamRequestWait   = 75 * time.Second
+	upstreamReconnectWait = 5 * time.Second
+)
+
+// overSocket is the ordinary way a message leaves: whatsmeow's own send, on whichever
+// client the session holds when it is called rather than one read earlier, so a message
+// built before a reconnect is not sent on the socket that reconnect replaced.
+func (s *Session) overSocket(
+	ctx context.Context, to waTypes.JID, messageID string, message *waE2E.Message,
+) (wm.SendResponse, error) {
+	return s.current().SendMessage(ctx, to, message, wm.SendRequestExtra{ID: messageID})
+}
+
+// textToSend renders the text and whatever rides along with it.
+//
+// A body on its own goes as the plain shape WhatsApp uses for one, because that is what
+// a phone sends and what every client renders without thinking about it. The extended
+// shape is for a message that carries something else: a quote, a mention, or the
+// chat's disappearing-message timer.
+func textToSend(content *textContent, alongside *waE2E.ContextInfo) (*waE2E.Message, error) {
+	if content.Body == "" {
+		return nil, protocol.NewError(protocol.ErrorInvalidPayload, "a text message with no body is not a message")
+	}
+	if alongside == nil {
+		return &waE2E.Message{Conversation: proto.String(content.Body)}, nil
+	}
+	return &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+		Text:        proto.String(content.Body),
+		ContextInfo: alongside,
+	}}, nil
+}
+
+// ownJID is this account's own address, in the form a message to this chat is sent
+// under. A quote attributed under the other form is one a client cannot match to
+// anybody, and WhatsApp names the same account by phone number in one chat and by LID
+// in the next.
+//
+// Which form it is, is whatsmeow's own rule rather than a guess: a direct chat is sent
+// under the LID whichever way the caller addressed it, because the library looks the
+// LID up and replaces the destination with it. A group is sent under the LID only when
+// the group itself is LID-addressed, and that is behind a cached lookup this connector
+// would have to pay a round trip for on the send path, so the phone number is used
+// there. The cost of being wrong is a quote of this account's own message that the
+// recipient cannot attribute, which is what it was before it was attributed at all.
+//
+// Read from the session's snapshot and not from the store, because whatsmeow writes
+// those fields from its pairing goroutine.
+func (s *Session) ownJID(to waTypes.JID) waTypes.JID {
+	phone, lid := s.identity()
+	direct := to.Server == waTypes.DefaultUserServer || to.Server == waTypes.HiddenUserServer
+	if direct && lid != "" {
+		return waTypes.NewJID(lid, waTypes.HiddenUserServer)
+	}
+	if phone != "" {
+		return waTypes.NewJID(phone, waTypes.DefaultUserServer)
+	}
+	if lid != "" {
+		return waTypes.NewJID(lid, waTypes.HiddenUserServer)
+	}
+	return waTypes.EmptyJID
+}
+
+// quotedParticipant names who wrote the message being answered.
+//
+// A caller only knows that for somebody else's message in a group; for its own it has
+// nobody to name, and for a direct chat it does not send one at all. Left off, a client
+// has a quote it cannot attribute. Both of the cases the caller cannot fill in are ones
+// this session can: its own account wrote it, or the only other party in the chat did.
+func quotedParticipant(req *sendRequest, own, to waTypes.JID) (waTypes.JID, error) {
+	if req.Quoted.Participant != nil {
+		return jidOf(*req.Quoted.Participant)
+	}
+	if req.Quoted.FromMe {
+		return own, nil
+	}
+	if to.Server == waTypes.GroupServer {
+		// Somebody else's message in a group, and the caller did not say whose. Guessing
+		// would attribute it to the group itself.
+		return waTypes.EmptyJID, nil
+	}
+	return to, nil
+}
+
+// contextToSend builds what goes alongside the body, and nil when nothing does.
+//
+// `own` is this account's own address and `to` is the chat, both of which the quote
+// needs and the caller cannot always supply.
+func contextToSend(req *sendRequest, own, to waTypes.JID) (*waE2E.ContextInfo, error) {
+	var alongside *waE2E.ContextInfo
+	ensure := func() *waE2E.ContextInfo {
+		if alongside == nil {
+			alongside = &waE2E.ContextInfo{}
+		}
+		return alongside
+	}
+
+	if req.Quoted != nil {
+		if req.Quoted.ID == "" {
+			// Skipping it would send the message without the frame the caller asked for
+			// and report success, so the reply lands stripped of what it was answering
+			// and nobody finds out. The contract requires the id for this reason.
+			return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+				"a quote has to name the message it is answering")
+		}
+		quote := ensure()
+		quote.StanzaID = proto.String(req.Quoted.ID)
+		participant, err := quotedParticipant(req, own, to)
+		if err != nil {
+			return nil, err
+		}
+		if !participant.IsEmpty() {
+			quote.Participant = proto.String(participant.String())
+		}
+	}
+	for _, mention := range req.Mentions {
+		jid, err := jidOf(mention)
+		if err != nil {
+			return nil, err
+		}
+		mentioned := ensure()
+		mentioned.MentionedJID = append(mentioned.MentionedJID, jid.String())
+	}
+	if req.Ephemeral > 0 {
+		// Carried per message, not per chat: WhatsApp expires a message by what the
+		// message itself says. A send that leaves it off in a chat on a timer is the one
+		// message in that conversation that stays behind after the rest has gone.
+		ensure().Expiration = proto.Uint32(req.Ephemeral)
+	}
+	return alongside, nil
+}
+
+// noLIDForNumber is how whatsmeow says a number has no LID, which is how it says the
+// number is not on WhatsApp.
+const noLIDForNumber = "no LID found for"
+
+// sendFailure turns whatsmeow's answer into a code a client can branch on. Anything
+// this does not name degrades to wa_error rather than leaking a library's wording into
+// somebody's dashboard.
+func sendFailure(err error) error {
+	switch {
+	case errors.Is(err, wm.ErrNotLoggedIn):
+		return because(protocol.ErrorNotPaired, "the session has no WhatsApp account to send from", err)
+	case errors.Is(err, wm.ErrNotConnected):
+		return because(protocol.ErrorNotConnected, "the session is not connected to WhatsApp", err)
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled),
+		errors.Is(err, wm.ErrMessageTimedOut), errors.Is(err, wm.ErrIQTimedOut):
+		// The message may well have gone out: what ran out is the answer, not the send,
+		// whether the deadline was the command's or WhatsApp's. Saying so is what lets
+		// the caller retry under the same id, which is the one retry that cannot
+		// duplicate anything. A refusal here would have it give up on a message that is
+		// already in somebody's chat.
+		return because(protocol.ErrorTimeout, "WhatsApp did not answer whether the message went out", err)
+	case strings.Contains(err.Error(), noLIDForNumber):
+		// whatsmeow sends every direct message under a LID, and looks one up for a
+		// number that does not have it cached. A number nobody has registered has none
+		// to find, and the answer is permanent: reported as a WhatsApp refusal it reads
+		// as something to try again, and a client retries a number that can never
+		// receive anything. Matched on the text because the library builds it with
+		// fmt.Errorf and there is no sentinel to compare against; a wording change on
+		// their side puts this back to where it is without one.
+		return because(protocol.ErrorRecipientNotOnWhatsapp,
+			"that number is not on WhatsApp", err)
+	case errors.Is(err, wm.ErrBroadcastListUnsupported):
+		// The library's own limit, not WhatsApp's, and the codes mean different things
+		// to a caller: a refusal is worth trying again and a limit never is. Reported as
+		// the former, a client retries a broadcast list for as long as it keeps the
+		// message.
+		return because(protocol.ErrorUnsupported,
+			"this connector cannot send to a broadcast list yet", err)
+	case errors.Is(err, wm.ErrUnknownServer), errors.Is(err, wm.ErrRecipientADJID):
+		return because(protocol.ErrorInvalidPayload, "that is not an address a message can be sent to", err)
+	default:
+		return because(protocol.ErrorWaError, "WhatsApp refused the message", err)
+	}
+}
+
+// because is the code a client branches on, carrying what actually happened for the one
+// reader who is allowed to see it.
+//
+// The wire is unchanged and deliberately so: the `*protocol.Error` is what `errors.As`
+// finds, what `asProtocolError` returns and what gets marshalled, so the frame is the
+// same bytes it has always been. What changes is `Error()`, and that is the whole point.
+// `logFailure` is by its own doc "the only place a command's real error is written down",
+// and it writes the failure through `zerolog`'s `Err`, which prints `Error()` and reads
+// nothing else -- no `Unwrap`, no field. Giving `protocol.Error` a cause it does not
+// print would have left that line byte for byte as it was, which is #291 unfixed with
+// `errors.Is` passing over it; measured rather than reasoned about, in the round that
+// wrote this.
+//
+// Two `%w`, so the chain carries both: the code for `errors.As` and the cause for
+// `errors.Is`. The reach of that second half is this function's callers and no further,
+// which is why the cause lives here rather than in `protocol.Error`, where every producer
+// in the repository would have gained one at once, and every site that asks `errors.Is`
+// against a context sentinel would have had to be re-read. The count of those is not
+// published here on purpose: a number in a comment is a number nothing checks, and this
+// one was already wrong once, in two different readings of what it counted.
+func because(code protocol.ErrorCode, message string, cause error) error {
+	return fmt.Errorf("%w: %w", protocol.NewError(code, message), cause)
+}

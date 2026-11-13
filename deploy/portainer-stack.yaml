@@ -1,0 +1,169 @@
+# [Marca] PortoMicro-Soluções em websistemas
+# [Link] https://portomicro.com.br
+#
+# Stack "whatsapp-nativo" — Chatwoot fazer.ai + fazer.ai WhatsApp Connector.
+# Adaptado de examples/docker-compose.separate.yaml do repositório
+# fazer-ai/whatsapp-connector para rodar como Stack no Portainer (CE, endpoint local).
+#
+# Diferenças em relação ao exemplo do repo, e por quê:
+#   - Chatwoot na porta 3001, para não encostar no 3000 da stack antiga (chatwoot_app2)
+#   - redis:8.0.3 e pgvector/pgvector:pg16, imagens que já existem neste engine
+#   - conector com imagem própria portomicro/portozzap-connect (WAC_IMAGE), construída
+#     e versionada por deploy/build-portozzap-connect.ps1
+#   - WAC_ADVERTISE_URL explícito: o Chatwoot baixa a mídia recebida pelo nome do
+#     serviço dentro da rede desta stack (o hostname do container não resolve fora dela)
+#   - SMTP reaproveitado da instalação existente, para convites e reset de senha
+#
+# Nada é compartilhado com chatwoot_app2 / postgres / redis / minha_rede: rede, volumes
+# e banco são próprios desta stack.
+
+version: "3.8"
+
+x-chatwoot: &chatwoot
+  image: ghcr.io/fazer-ai/chatwoot:${CHATWOOT_TAG:-latest}
+  restart: unless-stopped
+  volumes:
+    - chatwoot_storage:/app/storage
+  extra_hosts:
+    - "hub.2.chatwoot.com:127.0.0.1"
+  environment: &chatwoot-env
+    RAILS_ENV: production
+    NODE_ENV: production
+    INSTALLATION_ENV: docker
+    INSTALLATION_NAME: ${INSTALLATION_NAME:-PortoMicro WhatsApp}
+    DEFAULT_LOCALE: pt_BR
+    FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3001}
+    INTERNAL_HOST_URL: http://rails:3000
+    CHATWOOT_HUB_URL: ${FRONTEND_URL:-http://localhost:3001}
+    DISABLE_TELEMETRY: "true"
+    FORCE_SSL: "false"
+    ENABLE_ACCOUNT_SIGNUP: "true"
+    SECRET_KEY_BASE: ${SECRET_KEY_BASE:?defina SECRET_KEY_BASE}
+    POSTGRES_HOST: postgres
+    POSTGRES_PORT: "5432"
+    POSTGRES_USERNAME: chatwoot
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD}
+    POSTGRES_DATABASE: chatwoot_production
+    REDIS_URL: redis://redis:6379
+    REDIS_PASSWORD: ${REDIS_PASSWORD:?defina REDIS_PASSWORD}
+    ACTIVE_STORAGE_SERVICE: local
+    RAILS_LOG_TO_STDOUT: "true"
+    ENABLE_WEBSOCKETS: "true"
+    SIDEKIQ_CONCURRENCY: "5"
+    RAILS_MAX_THREADS: "5"
+    WEB_CONCURRENCY: "1"
+    ENABLE_RACK_ATTACK: "false"
+    USE_INBOX_AVATAR_FOR_BOT: "true"
+    # O conector roda como serviço desta stack, não dentro do Sidekiq
+    WHATSAPP_CONNECTOR_ENABLED: "true"
+    WHATSAPP_CONNECTOR_EMBEDDED: "false"
+    MAILER_SENDER_EMAIL: ${MAILER_SENDER_EMAIL:-suporte@portomicro.com.br}
+    MAILER_INBOUND_EMAIL_DOMAIN: ${MAILER_INBOUND_EMAIL_DOMAIN:-portomicro.com.br}
+    SMTP_DOMAIN: ${SMTP_DOMAIN:-smtp.zoho.com}
+    SMTP_ADDRESS: ${SMTP_ADDRESS:-smtp.zoho.com}
+    SMTP_PORT: ${SMTP_PORT:-465}
+    SMTP_USERNAME: ${SMTP_USERNAME:-suporte@portomicro.com.br}
+    SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+    SMTP_AUTHENTICATION: login
+    SMTP_ENABLE_STARTTLS_AUTO: "false"
+    SMTP_OPENSSL_VERIFY_MODE: peer
+
+services:
+  rails:
+    <<: *chatwoot
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # rails.sh prepara o banco (schema load num banco novo, migrations depois)
+    entrypoint: docker/entrypoints/rails.sh
+    command: [bundle, exec, rails, s, -p, '3000', -b, 0.0.0.0]
+    ports:
+      - '3001:3000'
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- --header="Accept: text/html" http://127.0.0.1:3000/ > /dev/null']
+      interval: 20s
+      timeout: 20s
+      retries: 20
+      start_period: 60s
+
+  sidekiq:
+    <<: *chatwoot
+    depends_on:
+      rails:
+        condition: service_healthy
+    command: [bundle, exec, sidekiq, -C, config/sidekiq.yml]
+    stop_grace_period: 30s
+    healthcheck:
+      # o argv do worker carrega a palavra sidekiq via script de entrypoint enquanto
+      # espera o schema, por isso o script sai da busca
+      test: ['CMD-SHELL', 'ps aux | grep [s]idekiq | grep -qv entrypoints']
+      interval: 20s
+      timeout: 20s
+      retries: 10
+      start_period: 60s
+
+  portozzap-connect:
+    image: ${WAC_IMAGE:-portomicro/portozzap-connect:latest}
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    # SIGTERM devolve as sessões ao Redis antes de sair
+    stop_grace_period: 30s
+    environment:
+      REDIS_URL: redis://redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?defina REDIS_PASSWORD}
+      WAC_ENGINE: whatsmeow
+      # SQLite basta para uma instância; para várias, aponte um Postgres próprio
+      WAC_DATABASE_URL: sqlite:/data/connector.db
+      WAC_MEDIA_ROOT: /data/media
+      WAC_MEDIA_TOKEN: ${WAC_MEDIA_TOKEN:?defina WAC_MEDIA_TOKEN}
+      WAC_HTTP_ADDR: ':8080'
+      WAC_ADVERTISE_URL: http://portozzap-connect:8080
+      WAC_LOG_LEVEL: ${WAC_LOG_LEVEL:-info}
+      # Chamadas de voz desligadas. Para ligar: PUBLIQUE a porta UDP abaixo e defina
+      # WAC_CALLS_UDP_PORT=40000 + WAC_CALLS_PUBLIC_IP no ambiente da stack.
+      # WAC_CALLS_UDP_PORT: '40000'
+      # WAC_CALLS_PUBLIC_IP: ${WAC_CALLS_PUBLIC_IP}
+    ports:
+      - '8085:8080'
+      - '40000:40000/udp'
+    volumes:
+      - portozzap-connect:/data
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: chatwoot_production
+      POSTGRES_USER: chatwoot
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD}
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U chatwoot -d chatwoot_production']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:8.0.3
+    restart: unless-stopped
+    command: ['sh', '-c', 'redis-server --requirepass "$$REDIS_PASSWORD"']
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?defina REDIS_PASSWORD}
+    volumes:
+      - redis:/data
+    healthcheck:
+      test: ['CMD-SHELL', 'redis-cli -a "$$REDIS_PASSWORD" ping | grep -q PONG']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  chatwoot_storage:
+  postgres:
+  redis:
+  portozzap-connect:

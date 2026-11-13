@@ -1,0 +1,595 @@
+package cluster_test
+
+import (
+	"context"
+	"errors"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
+
+	"github.com/fazer-ai/whatsapp-connector/internal/cluster"
+	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
+)
+
+// fakeClock is driven by the test rather than by the wall clock: a lease expiring is
+// the behaviour under test, and sleeping for it would make the suite slow and flaky.
+type fakeClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func newClock() *fakeClock {
+	return &fakeClock{now: time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)}
+}
+
+func (c *fakeClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *fakeClock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
+}
+
+// Two instances against one Redis, which is the only configuration where the
+// interesting bugs live.
+func newFleet(t *testing.T, clock cluster.Clock) (server *miniredis.Miniredis, a, b *cluster.Leases) {
+	t.Helper()
+	server = miniredis.RunT(t)
+	build := func(instance string) *cluster.Leases {
+		rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+		t.Cleanup(func() { _ = rdb.Close() })
+		return cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), instance, cluster.Options{Clock: clock})
+	}
+	return server, build("inst-a"), build("inst-b")
+}
+
+func TestAcquireIsExclusive(t *testing.T) {
+	t.Parallel()
+
+	_, a, b := newFleet(t, newClock())
+	ctx := context.Background()
+
+	lease, err := a.Acquire(ctx, "s1")
+	if err != nil {
+		t.Fatalf("a.Acquire: %v", err)
+	}
+	if lease.Epoch != 1 {
+		t.Errorf("first epoch = %d, want 1", lease.Epoch)
+	}
+
+	if _, err := b.Acquire(ctx, "s1"); !errors.Is(err, cluster.ErrNotOwner) {
+		t.Fatalf("b.Acquire while a holds it = %v, want ErrNotOwner", err)
+	}
+	if _, owned := b.Owned("s1"); owned {
+		t.Error("b believes it owns a session it never won")
+	}
+}
+
+// The epoch is what tells a client "this state is from the new owner". It has to move
+// on every handover, or a write from the previous owner is indistinguishable.
+func TestEpochRisesOnEveryHandover(t *testing.T) {
+	t.Parallel()
+
+	_, a, b := newFleet(t, newClock())
+	ctx := context.Background()
+
+	first, err := a.Acquire(ctx, "s1")
+	if err != nil {
+		t.Fatalf("a.Acquire: %v", err)
+	}
+	if _, err := a.Release(ctx, "s1"); err != nil {
+		t.Fatalf("a.Release: %v", err)
+	}
+
+	second, err := b.Acquire(ctx, "s1")
+	if err != nil {
+		t.Fatalf("b.Acquire: %v", err)
+	}
+	if second.Epoch <= first.Epoch {
+		t.Fatalf("epoch went %d -> %d, want strictly increasing", first.Epoch, second.Epoch)
+	}
+}
+
+func TestReleaseOnlyDropsYourOwnLease(t *testing.T) {
+	t.Parallel()
+
+	_, a, b := newFleet(t, newClock())
+	ctx := context.Background()
+
+	if _, err := a.Acquire(ctx, "s1"); err != nil {
+		t.Fatalf("a.Acquire: %v", err)
+	}
+
+	released, err := b.Release(ctx, "s1")
+	if err != nil {
+		t.Fatalf("b.Release: %v", err)
+	}
+	if released {
+		t.Fatal("b released a lease it does not hold")
+	}
+	if _, owned := a.Owned("s1"); !owned {
+		t.Fatal("a lost its lease to another instance's release")
+	}
+}
+
+func TestRenewKeepsTheLeaseAlive(t *testing.T) {
+	t.Parallel()
+
+	clock := newClock()
+	server, a, _ := newFleet(t, clock)
+	ctx := context.Background()
+
+	if _, err := a.Acquire(ctx, "s1"); err != nil {
+		t.Fatalf("a.Acquire: %v", err)
+	}
+
+	clock.advance(20 * time.Second)
+	server.FastForward(20 * time.Second)
+	if err := a.Renew(ctx, "s1"); err != nil {
+		t.Fatalf("a.Renew: %v", err)
+	}
+	if _, owned := a.Owned("s1"); !owned {
+		t.Fatal("a does not own a session it renewed a moment ago")
+	}
+}
+
+// The dangerous direction: a renewal must not extend a lease that has already moved.
+func TestRenewRefusesAfterTheLeaseMoved(t *testing.T) {
+	t.Parallel()
+
+	clock := newClock()
+	server, a, b := newFleet(t, clock)
+	ctx := context.Background()
+
+	if _, err := a.Acquire(ctx, "s1"); err != nil {
+		t.Fatalf("a.Acquire: %v", err)
+	}
+
+	server.FastForward(cluster.DefaultTTL + time.Second)
+	if _, err := b.Acquire(ctx, "s1"); err != nil {
+		t.Fatalf("b.Acquire after expiry: %v", err)
+	}
+
+	if err := a.Renew(ctx, "s1"); !errors.Is(err, cluster.ErrNotOwner) {
+		t.Fatalf("a.Renew after b took over = %v, want ErrNotOwner", err)
+	}
+	if _, owned := a.Owned("s1"); owned {
+		t.Fatal("a still believes it owns a session it was told it lost")
+	}
+	if _, owned := b.Owned("s1"); !owned {
+		t.Fatal("b does not own the session it just took")
+	}
+}
+
+// Ownership is answered locally, so a lease nobody renewed has to stop counting as
+// owned on its own, without asking Redis. This is the guard the store writes sit
+// behind.
+func TestOwnedGoesStaleWithoutARenewal(t *testing.T) {
+	t.Parallel()
+
+	clock := newClock()
+	_, a, _ := newFleet(t, clock)
+	ctx := context.Background()
+
+	if _, err := a.Acquire(ctx, "s1"); err != nil {
+		t.Fatalf("a.Acquire: %v", err)
+	}
+	if _, owned := a.Owned("s1"); !owned {
+		t.Fatal("a does not own the session it just acquired")
+	}
+
+	clock.advance(cluster.DefaultTTL - cluster.DefaultRenewMargin)
+	if _, owned := a.Owned("s1"); owned {
+		t.Fatal("a still acts on a lease it has not renewed within the margin")
+	}
+}
+
+// Held is what the renew loop iterates, so a lease that has gone stale locally must
+// still be in it: forgetting it there is what stops it from ever being renewed or
+// released.
+func TestHeldListsWhatWasAcquired(t *testing.T) {
+	t.Parallel()
+
+	clock := newClock()
+	_, a, _ := newFleet(t, clock)
+	ctx := context.Background()
+
+	for _, sid := range []string{"s1", "s2"} {
+		if _, err := a.Acquire(ctx, sid); err != nil {
+			t.Fatalf("a.Acquire(%s): %v", sid, err)
+		}
+	}
+	clock.advance(cluster.DefaultTTL)
+
+	if got := len(a.Held()); got != 2 {
+		t.Fatalf("Held() has %d entries, want 2", got)
+	}
+}
+
+// Owned answers from local state on every write, and the renew loop rewrites that state
+// on its own goroutine. The two have to be safe together, and an entry that escaped the
+// lock as a pointer was not: the reader saw a renewal timestamp mid-write.
+func TestOwnedAndRenewAreSafeTogether(t *testing.T) {
+	t.Parallel()
+
+	_, leases, _ := newFleet(t, newClock())
+	ctx := context.Background()
+	if _, err := leases.Acquire(ctx, "s1"); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for range 200 {
+			if err := leases.Renew(ctx, "s1"); err != nil {
+				t.Errorf("Renew: %v", err)
+				return
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for range 200 {
+			if _, owned := leases.Owned("s1"); !owned {
+				t.Error("a lease being renewed reported itself lost")
+				return
+			}
+		}
+	}()
+	wg.Wait()
+}
+
+// roundTrips counts what the client actually sends: one per command run on its own, and
+// one per pipeline however many commands it carries.
+type roundTrips struct{ n atomic.Int64 }
+
+func (*roundTrips) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (r *roundTrips) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		r.n.Add(1)
+		return next(ctx, cmd)
+	}
+}
+
+func (r *roundTrips) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		r.n.Add(1)
+		return next(ctx, cmds)
+	}
+}
+
+// The renew pass runs on the goroutine that also reads commands, under a budget written
+// in fixed durations. A round trip per session puts a term proportional to the number of
+// sessions inside a bound that names none of them, and the sessions at the end of the
+// list are the ones a peer takes while this instance still holds their sockets.
+func TestRenewManyRenewsEverySessionInOneRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	clock := newClock()
+	leases := cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{Clock: clock})
+	ctx := context.Background()
+
+	sids := []string{"s1", "s2", "s3", "s4", "s5"}
+	for _, sid := range sids {
+		if _, err := leases.Acquire(ctx, sid); err != nil {
+			t.Fatalf("Acquire %s: %v", sid, err)
+		}
+	}
+
+	// Counted from here, so the acquisitions above are not part of the measurement. The
+	// client keeps pipelines on a pool of their own, and the connection it dials for the
+	// first one runs its handshake through the hooks: dialled here, so the count is the
+	// renewal's and not the connection's.
+	if _, err := rdb.Pipelined(ctx, func(pipe redis.Pipeliner) error { return pipe.Ping(ctx).Err() }); err != nil {
+		t.Fatalf("warming the pipeline connection: %v", err)
+	}
+	var trips roundTrips
+	rdb.AddHook(&trips)
+
+	renew := func(when string) {
+		t.Helper()
+		clock.advance(20 * time.Second)
+		server.FastForward(20 * time.Second)
+		for sid, err := range leases.RenewMany(ctx, sids) {
+			if err != nil {
+				t.Fatalf("RenewMany %s (%s): %v", sid, when, err)
+			}
+		}
+		for _, sid := range sids {
+			if _, owned := leases.Owned(sid); !owned {
+				t.Fatalf("%s is not owned after a renewal that reported success (%s)", sid, when)
+			}
+		}
+	}
+
+	// The first pass finds the script unloaded, which costs one more batch and not one
+	// call per session: a restart or a SCRIPT FLUSH must not turn a tick into N trips.
+	renew("cold")
+	if got := trips.n.Load(); got > 2 {
+		t.Fatalf("the first renewal of %d sessions took %d round trips, want at most 2", len(sids), got)
+	}
+
+	trips.n.Store(0)
+	renew("warm")
+	if got := trips.n.Load(); got != 1 {
+		t.Fatalf("renewing %d sessions took %d round trips, want 1", len(sids), got)
+	}
+}
+
+// One lease lost says nothing about the next, so the answer has to be per session: the
+// pipeline reports the first failure and the caller stops the one session it names.
+func TestRenewManyAnswersForEachSessionOnItsOwn(t *testing.T) {
+	t.Parallel()
+
+	clock := newClock()
+	server, a, b := newFleet(t, clock)
+	ctx := context.Background()
+
+	for _, sid := range []string{"s1", "s2"} {
+		if _, err := a.Acquire(ctx, sid); err != nil {
+			t.Fatalf("a.Acquire %s: %v", sid, err)
+		}
+	}
+	// s1 alone moves: expired, then taken by the peer.
+	server.FastForward(cluster.DefaultTTL + time.Second)
+	if _, err := b.Acquire(ctx, "s1"); err != nil {
+		t.Fatalf("b.Acquire: %v", err)
+	}
+	if _, err := a.Acquire(ctx, "s2"); err != nil {
+		t.Fatalf("a.Acquire s2 again: %v", err)
+	}
+
+	answers := a.RenewMany(ctx, []string{"s1", "s2"})
+	if !errors.Is(answers["s1"], cluster.ErrNotOwner) {
+		t.Errorf("RenewMany s1 = %v, want ErrNotOwner", answers["s1"])
+	}
+	if answers["s2"] != nil {
+		t.Errorf("RenewMany s2 = %v, want nil: losing one lease is not losing the other", answers["s2"])
+	}
+	if _, owned := a.Owned("s1"); owned {
+		t.Error("a still believes it owns the session it was told it lost")
+	}
+	if _, owned := a.Owned("s2"); !owned {
+		t.Error("a dropped a session whose renewal succeeded")
+	}
+}
+
+// advancingClock moves the test's clock while a command is in flight, which is how a
+// round trip that takes real time looks to a lease holder driven by a fake clock.
+type advancingClock struct {
+	clock *fakeClock
+	by    time.Duration
+	on    func(redis.Cmder) bool
+}
+
+func (advancingClock) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h advancingClock) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		err := next(ctx, cmd)
+		if h.on(cmd) {
+			h.clock.advance(h.by)
+		}
+		return err
+	}
+}
+
+func (h advancingClock) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		err := next(ctx, cmds)
+		// Asked per command here too, and not once per batch. go-redis opens a connection
+		// with a pipeline of its own (`client` calls in a handshake), so a batch that
+		// advances the clock whatever is in it moves time for reasons the test never
+		// named -- and a test whose clock moves by itself passes without measuring what
+		// it says it measures.
+		if slices.ContainsFunc(cmds, h.on) {
+			h.clock.advance(h.by)
+		}
+		return err
+	}
+}
+
+// Redis starts the new TTL when the script runs, which is before the answer is read and,
+// in a pipeline, a whole batch before it. A lease stamped on arrival is dated later than
+// Redis dates it, and Owned then keeps saying yes past the moment the key expires and a
+// peer can take it -- which is two sockets on one account.
+func TestARenewalIsDatedFromWhenItWasSent(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	clock := newClock()
+	leases := cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{Clock: clock})
+	ctx := context.Background()
+
+	if _, err := leases.Acquire(ctx, "s1"); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+
+	// The renewal itself takes as long as the lease has to give: sent now, answered a
+	// fresh lifetime later. Whatever Redis did, it did at the start of that.
+	rdb.AddHook(advancingClock{
+		clock: clock,
+		by:    cluster.DefaultTTL - cluster.DefaultRenewMargin,
+		on:    func(cmd redis.Cmder) bool { return strings.HasPrefix(cmd.Name(), "eval") },
+	})
+
+	for sid, err := range leases.RenewMany(ctx, []string{"s1"}) {
+		if err != nil {
+			t.Fatalf("RenewMany %s: %v", sid, err)
+		}
+	}
+	if _, owned := leases.Owned("s1"); owned {
+		t.Fatal("a lease renewed by a round trip that outlasted its fresh lifetime still counts as owned")
+	}
+}
+
+// The same for an acquisition, and with one more round trip inside it: Redis starts the
+// TTL when the acquiring script runs, and the epoch is read after that. A lease stamped once both have
+// answered is dated later than Redis dates it, by however long the acquisition took --
+// which is exactly the moment Redis is slow enough for it to matter. It is the store's
+// question now as well as the socket's: every fenced write asks whether this lease is
+// still good.
+func TestAnAcquisitionIsDatedFromWhenItWasSent(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	clock := newClock()
+	leases := cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{Clock: clock})
+
+	// The acquisition takes as long as the lease has to give, spent on the way there.
+	// It is a script rather than a bare SET because taking the lease and reading whether
+	// its holder is handing it back have to be one step, so the hook names an eval; this
+	// test acquires once and renews never, so nothing else answers to that.
+	rdb.AddHook(advancingClock{
+		clock: clock,
+		by:    cluster.DefaultTTL - cluster.DefaultRenewMargin,
+		on:    func(cmd redis.Cmder) bool { return strings.HasPrefix(cmd.Name(), "eval") },
+	})
+
+	if _, err := leases.Acquire(context.Background(), "s1"); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if _, owned := leases.Owned("s1"); owned {
+		t.Fatal("a lease acquired by a round trip that outlasted its fresh lifetime still counts as owned")
+	}
+}
+
+// And dated from the request that actually started the TTL, which on the first
+// acquisition after a restart or a SCRIPT FLUSH is not the first one sent. The digest is
+// not loaded, the EVALSHA comes back NOSCRIPT having started nothing, and Redis begins
+// the lifetime at the EVAL behind it. A lease dated from before both is short by a whole
+// failed round trip, and the local answer to "do I still own this" -- which every fenced
+// write asks -- expires that much before the key does.
+func TestAnAcquisitionIsDatedFromTheRequestThatStartedTheLease(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	clock := newClock()
+	leases := cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{Clock: clock})
+	ctx := context.Background()
+
+	// Nothing is loaded, so the acquisition below pays for the digest that is not there.
+	if err := rdb.ScriptFlush(ctx).Err(); err != nil {
+		t.Fatalf("ScriptFlush: %v", err)
+	}
+
+	// Half of what the lease has to give, per round trip. One of them is what Redis
+	// starts the TTL after, and the lease survives it; two is what dating from before
+	// the failed one charges, and that is the whole lifetime.
+	rdb.AddHook(advancingClock{
+		clock: clock,
+		by:    (cluster.DefaultTTL - cluster.DefaultRenewMargin) / 2,
+		on:    func(cmd redis.Cmder) bool { return strings.HasPrefix(cmd.Name(), "eval") },
+	})
+
+	if _, err := leases.Acquire(ctx, "s1"); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if _, owned := leases.Owned("s1"); !owned {
+		t.Fatal("a lease was dated from an EVALSHA that came back unloaded and started no TTL, so it reads as expired a whole failed round trip before the key does")
+	}
+}
+
+// The epoch counter is a fencing token: a client drops events carrying a lower epoch
+// than the highest it has seen, which is what keeps a late event from a previous owner
+// off a session somebody else is running. Deleting one that belongs to a live owner
+// restarts their count at one, under a cursor that is already higher, so every event
+// they publish next reads as stale.
+//
+// It matters here because an instance can believe it holds a lease that expired in
+// Redis -- that is what the renew margin exists for -- so the deletion has to be
+// compared against the lease in the same step rather than sent as a bare DEL.
+func TestForgetEpochOnlyDropsTheCounterOfALeaseYouStillHold(t *testing.T) {
+	t.Parallel()
+
+	server, a, b := newFleet(t, newClock())
+	ctx := context.Background()
+	keys := redisx.NewKeys("wa:", 8)
+
+	if _, err := a.Acquire(ctx, "s1"); err != nil {
+		t.Fatalf("a.Acquire: %v", err)
+	}
+	if !server.Exists(keys.LeaseEpoch("s1")) {
+		t.Fatal("acquiring a lease wrote no epoch counter, so this test proves nothing")
+	}
+
+	if err := b.ForgetEpoch(ctx, "s1"); !errors.Is(err, cluster.ErrNotOwner) {
+		t.Fatalf("an instance that holds nothing deleted the epoch of a live owner (err=%v)", err)
+	}
+	if !server.Exists(keys.LeaseEpoch("s1")) {
+		t.Fatal("the counter of a session another instance owns was deleted; its next epoch counts from one again, under a client cursor that is already higher")
+	}
+
+	if err := a.ForgetEpoch(ctx, "s1"); err != nil {
+		t.Fatalf("the owner could not delete the counter of the account it holds: %v", err)
+	}
+	if server.Exists(keys.LeaseEpoch("s1")) {
+		t.Fatal("the counter outlived the account it belonged to, which is the leak this exists to close")
+	}
+}
+
+// The counter must not expire, and this is the only thing in the repository that says so.
+//
+// A TTL here is the fix that suggests itself to whoever notices the key growing without
+// bound (#159), and it is worse than the leak it removes. The key would expire while
+// nobody held the session; the next acquisition would count from one again; an owner
+// still holding eight -- a process that was paused, a socket that outlived its lease, a
+// delivery that sat in a queue -- would publish an event that out-ranks the live owner's,
+// and the client, which drops what is lower and keeps what is higher, would take it.
+// Kilobytes against silent corruption is not a trade, and the trade is invisible: with an
+// EXPIRE added after the increment, every other test in this repository still passes.
+//
+// Asserted on both writes, because they are separate statements in separate scripts and
+// a renew that sets one is as wrong as an acquire that does.
+func TestTheEpochCounterOutlivesEveryTTLTheLeaseItselfHas(t *testing.T) {
+	t.Parallel()
+
+	server, a, _ := newFleet(t, newClock())
+	ctx := context.Background()
+	keys := redisx.NewKeys("wa:", 8)
+	epoch := keys.LeaseEpoch("s1")
+
+	if _, err := a.Acquire(ctx, "s1"); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if !server.Exists(epoch) {
+		t.Fatal("acquiring a lease wrote no epoch counter, so this test proves nothing")
+	}
+	if ttl := server.TTL(epoch); ttl != 0 {
+		t.Fatalf("the epoch counter was given a TTL of %v by the acquire; it must not expire while the account exists, or a stale owner out-ranks the live one after it does", ttl)
+	}
+	// The lease does expire, and asserting that here is what keeps the check above from
+	// passing against a Redis that lost every TTL it was given.
+	if ttl := server.TTL(keys.Lease("s1")); ttl <= 0 {
+		t.Fatalf("the lease itself has no TTL (%v), so the assertion above cannot tell an epoch that keeps its lifetime from a server that drops every one", ttl)
+	}
+
+	if err := a.Renew(ctx, "s1"); err != nil {
+		t.Fatalf("Renew: %v", err)
+	}
+	if ttl := server.TTL(epoch); ttl != 0 {
+		t.Fatalf("the epoch counter was given a TTL of %v by the renew; the lease is what expires, and the counter is what tells a client which owner is current", ttl)
+	}
+}

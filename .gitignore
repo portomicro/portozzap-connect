@@ -1,0 +1,31 @@
+# Build output
+/bin/
+/dist/
+*.test
+*.out
+coverage.txt
+
+# Runtime data (media blobs, sqlite store)
+/data/
+*.db
+*.db-shm
+*.db-wal
+
+# Local env
+.env
+.env.*
+!.env.example
+
+# Editors / OS
+.DS_Store
+.idea/
+*.swp
+
+# Binário que `make bench-fleet` compila quando BENCH_BIN aponta para a raiz
+/fleetbench
+
+# Logs locais e segredos do deploy (nunca versionar)
+/logs/
+**/logs/
+deploy/portainer-env.txt
+# portozzap-env-secrets

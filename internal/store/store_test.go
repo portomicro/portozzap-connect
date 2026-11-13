@@ -1,0 +1,1579 @@
+package store_test
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
+	"github.com/rs/zerolog"
+	"go.mau.fi/whatsmeow/proto/waAdv"
+	"go.mau.fi/whatsmeow/types"
+
+	"github.com/fazer-ai/whatsapp-connector/internal/cluster"
+	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
+	"github.com/fazer-ai/whatsapp-connector/internal/store"
+	"github.com/fazer-ai/whatsapp-connector/internal/store/storetest"
+)
+
+// deviceCounter gives every pairing its own device part, the way WhatsApp does.
+var deviceCounter atomic.Uint32
+
+func TestOpenRejectsAnUnknownURL(t *testing.T) {
+	t.Parallel()
+
+	for _, url := range []string{"", "mysql://localhost/wa", "/var/lib/wa.db"} {
+		if _, err := store.Open(t.Context(), url, store.AlwaysOwned, zerolog.Nop()); err == nil {
+			t.Fatalf("opened %q, want an error", url)
+		}
+	}
+}
+
+func TestDeviceIsFreshUntilSomethingIsBound(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+
+	device, err := container.For("sid-1").Device(t.Context())
+	if err != nil {
+		t.Fatalf("Device: %v", err)
+	}
+	if device.ID != nil {
+		t.Fatalf("a session that never paired came back with a jid: %s", device.ID)
+	}
+	if device.NoiseKey == nil || device.IdentityKey == nil {
+		t.Fatal("a fresh device came back without its keys")
+	}
+}
+
+func TestDeviceResumesWhatWasBound(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	ctx := t.Context()
+
+	jid := pair(t, container, "sid-1", "5511999990001")
+
+	device, err := container.For("sid-1").Device(ctx)
+	if err != nil {
+		t.Fatalf("Device: %v", err)
+	}
+	if device.ID == nil || device.ID.User != jid.User {
+		t.Fatalf("resumed %v, want the device of %s", device.ID, jid)
+	}
+
+	// A different session must not be handed the same credentials.
+	other, err := container.For("sid-2").Device(ctx)
+	if err != nil {
+		t.Fatalf("Device: %v", err)
+	}
+	if other.ID != nil {
+		t.Fatalf("a second session resumed %s", other.ID)
+	}
+}
+
+func TestBindMovesADeviceOffItsPreviousSession(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	ctx := t.Context()
+
+	jid := pair(t, container, "sid-old", "5511999990001")
+	if err := container.For("sid-new").Bind(ctx, jid); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	if _, bound, err := container.For("sid-old").JID(ctx); err != nil || bound {
+		t.Fatalf("the old session is still bound (bound=%v, err=%v)", bound, err)
+	}
+	bound, ok, err := container.For("sid-new").JID(ctx)
+	if err != nil || !ok || bound.User != jid.User {
+		t.Fatalf("the new session holds %v (ok=%v, err=%v)", bound, ok, err)
+	}
+}
+
+func TestDeviceForgetsAMappingWhoseDeviceIsGone(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	ctx := t.Context()
+
+	// A mapping written for a device that was never stored is what a crash between
+	// Bind and whatsmeow's own write leaves behind.
+	jid, err := types.ParseJID("5511999990002@s.whatsapp.net")
+	if err != nil {
+		t.Fatalf("ParseJID: %v", err)
+	}
+	if err := container.For("sid-1").Bind(ctx, jid); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	device, err := container.For("sid-1").Device(ctx)
+	if err != nil {
+		t.Fatalf("Device: %v", err)
+	}
+	if device.ID != nil {
+		t.Fatalf("resumed %s from a device that is not stored", device.ID)
+	}
+	if _, bound, err := container.For("sid-1").JID(ctx); err != nil || bound {
+		t.Fatalf("the dangling mapping survived (bound=%v, err=%v)", bound, err)
+	}
+}
+
+func TestForgetRemovesTheDeviceAndTheMapping(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	ctx := t.Context()
+
+	jid := pair(t, container, "sid-1", "5511999990001")
+	if err := container.For("sid-1").ForgetCredentialsAndDesired(ctx); err != nil {
+		t.Fatalf("ForgetCredentialsAndDesired: %v", err)
+	}
+
+	if _, bound, err := container.For("sid-1").JID(ctx); err != nil || bound {
+		t.Fatalf("the mapping survived a logout (bound=%v, err=%v)", bound, err)
+	}
+	stored, err := container.Devices().GetDevice(ctx, jid)
+	if err != nil {
+		t.Fatalf("GetDevice: %v", err)
+	}
+	if stored != nil {
+		t.Fatal("the device survived a logout")
+	}
+
+	// Forgetting a session that never paired is what a delete on an unpaired inbox
+	// does, and it is not an error.
+	if err := container.For("sid-never").ForgetCredentialsAndDesired(ctx); err != nil {
+		t.Fatalf("Forget on an unpaired session: %v", err)
+	}
+}
+
+func TestBindRefusesAnIncompleteCall(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+
+	jid, err := types.ParseJID("5511999990001@s.whatsapp.net")
+	if err != nil {
+		t.Fatalf("ParseJID: %v", err)
+	}
+	if err := container.For("").Bind(t.Context(), jid); err == nil {
+		t.Fatal("bound a device to no session")
+	}
+	if err := container.For("sid-1").Bind(t.Context(), types.EmptyJID); err == nil {
+		t.Fatal("bound a session to no device")
+	}
+}
+
+// open returns a container on a database of its own, which goes with the test.
+func open(t *testing.T) *store.Container {
+	t.Helper()
+	return openAt(t, storetest.New(t))
+}
+
+// openAt is the half of open the tests that keep the address use: the ones that close
+// the container and open it again, to watch a migration run over a store that is
+// already there.
+func openAt(t *testing.T, target storetest.Target) *store.Container {
+	t.Helper()
+
+	container, err := store.Open(t.Context(), target.URL, store.AlwaysOwned, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := container.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+	return container
+}
+
+// pair stores a device for a phone number and binds it to a session, which is what
+// whatsmeow and the engine between them do on a successful pairing.
+func pair(t *testing.T, container *store.Container, sid, phone string) types.JID {
+	t.Helper()
+	ctx := context.Background()
+	// WhatsApp issues a companion device JID, device part and all, and that is the key
+	// whatsmeow files the device under. Each pairing gets its own, the way a real one
+	// does.
+	jid, err := types.ParseJID(fmt.Sprintf("%s:%d@s.whatsapp.net", phone, deviceCounter.Add(1)))
+	if err != nil {
+		t.Fatalf("ParseJID: %v", err)
+	}
+	device := container.Devices().NewDevice()
+	device.ID = &jid
+	// whatsmeow fills the account identity during pairing and refuses to store a
+	// device without one, so the test stands in for that half.
+	device.Account = &waAdv.ADVSignedDeviceIdentity{
+		Details:             make([]byte, 32),
+		AccountSignature:    make([]byte, 64),
+		AccountSignatureKey: make([]byte, 32),
+		DeviceSignature:     make([]byte, 64),
+	}
+	if err := container.Devices().PutDevice(ctx, device); err != nil {
+		t.Fatalf("PutDevice: %v", err)
+	}
+	if err := container.For(sid).Bind(ctx, jid); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	return jid
+}
+
+// WhatsApp pairs a companion device and names it with the device part attached. That
+// full JID is the key whatsmeow files the device under, so a mapping that drops it
+// finds nothing on the next boot, reads the session as unpaired, and asks the operator
+// to scan another code for a session that never stopped being paired.
+func TestDeviceResumesACompanionDeviceJID(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	ctx := t.Context()
+
+	jid := pair(t, container, "sid-1", "5511999990001")
+	if jid.Device == 0 {
+		t.Fatalf("the test paired %s, which carries no device part", jid)
+	}
+
+	device, err := container.For("sid-1").Device(ctx)
+	if err != nil {
+		t.Fatalf("Device: %v", err)
+	}
+	if device.ID == nil {
+		t.Fatal("a paired companion device came back unpaired")
+	}
+	if device.ID.String() != jid.String() {
+		t.Fatalf("resumed %s, want %s", device.ID, jid)
+	}
+}
+
+// Re-pairing an account issues a new device rather than reusing the old one, so the
+// rule is one session per account and the credentials it displaces are deleted: they
+// are unreachable, and WhatsApp has already unlinked them.
+func TestBindDeletesTheDeviceItDisplaces(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	ctx := t.Context()
+
+	old := pair(t, container, "sid-old", "5511999990001")
+	fresh := pair(t, container, "sid-new", "5511999990001")
+	if old.String() == fresh.String() {
+		t.Fatal("the test paired the same device twice")
+	}
+
+	if _, bound, err := container.For("sid-old").JID(ctx); err != nil || bound {
+		t.Fatalf("the displaced session is still bound (bound=%v, err=%v)", bound, err)
+	}
+	stored, err := container.Devices().GetDevice(ctx, old)
+	if err != nil {
+		t.Fatalf("GetDevice: %v", err)
+	}
+	if stored != nil {
+		t.Fatal("the displaced device survived, holding credentials nothing can reach")
+	}
+}
+
+// whatsmeow refuses to bring its schema up on SQLite with foreign keys off, and the
+// driver leaves them off. An operator writing the documented url should not have to
+// know that.
+//
+// On its own address rather than the suite's, and the only test here that is: this one
+// is about what the SQLite url leaves off, so a Postgres pass of it would be a different
+// test rather than the same one twice.
+func TestSQLiteOpensWithoutSpellingOutThePragma(t *testing.T) {
+	t.Parallel()
+
+	address := "sqlite:" + filepath.Join(t.TempDir(), "wac.db")
+	container, err := store.Open(t.Context(), address, store.AlwaysOwned, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("Open %q: %v", address, err)
+	}
+	if err := container.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+// whatsmeow writes its own tables from every path it has at once: a receipt saves a
+// session while a decrypt saves an identity while the connector records a pairing. The
+// first live pairing turned that into a wall of `database is locked (5)`, which is not
+// cosmetic: an identity key that cannot be saved is a message that cannot be decrypted,
+// and the app state key share inside one of those is why the account's contacts and
+// chats never synced either.
+//
+// The test writes through both halves of the container at once, which is the shape that
+// failed. It is not a stress test and a passing run is not a promise about a busy
+// deployment; it is a floor, and the floor is that ordinary concurrent use does not
+// return an error.
+func TestConcurrentWritersDoNotCollide(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	ctx := t.Context()
+
+	const writers = 8
+	const rounds = 12
+
+	failures := make(chan error, writers*rounds*2)
+	var wg sync.WaitGroup
+	for writer := range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for round := range rounds {
+				jid, err := types.ParseJID(fmt.Sprintf("55119999%05d:%d@s.whatsapp.net", writer, round+1))
+				if err != nil {
+					failures <- err
+					return
+				}
+				device := container.Devices().NewDevice()
+				device.ID = &jid
+				device.Account = &waAdv.ADVSignedDeviceIdentity{
+					Details:             make([]byte, 32),
+					AccountSignature:    make([]byte, 64),
+					AccountSignatureKey: make([]byte, 32),
+					DeviceSignature:     make([]byte, 64),
+				}
+				if err := container.Devices().PutDevice(ctx, device); err != nil {
+					failures <- fmt.Errorf("PutDevice: %w", err)
+					return
+				}
+				if err := container.For(fmt.Sprintf("sid-%d", writer)).Bind(ctx, jid); err != nil {
+					failures <- fmt.Errorf("Bind: %w", err)
+					return
+				}
+				if _, _, err := container.For(fmt.Sprintf("sid-%d", writer)).JID(ctx); err != nil {
+					failures <- fmt.Errorf("JID: %w", err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(failures)
+
+	for err := range failures {
+		t.Errorf("a concurrent writer failed: %v", err)
+	}
+}
+
+// The rule is one session per account, and Bind used to enforce it by reading the
+// competing mappings and then writing. Two pairings of the same number landing together
+// both read nothing and both write, so the account ends up on two sessions and the
+// displacement never happens: the second session's socket works while the first's
+// credentials are still on file, and a restart hands the account to whichever row is
+// found. A constraint is the only version of that check two writers cannot both pass.
+func TestOneAccountKeepsOneMappingUnderConcurrentPairings(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	ctx := t.Context()
+
+	const account = "5511999990001"
+	const pairings = 8
+
+	var wg sync.WaitGroup
+	failures := make(chan error, pairings)
+	for i := range pairings {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			jid, err := types.ParseJID(fmt.Sprintf("%s:%d@s.whatsapp.net", account, deviceCounter.Add(1)))
+			if err != nil {
+				failures <- err
+				return
+			}
+			// A pairing that loses the race is a pairing refused, which is a correct
+			// outcome; a pairing that wins and leaves a second mapping behind is not.
+			if err := container.For(fmt.Sprintf("sid-%d", i)).Bind(ctx, jid); err != nil {
+				failures <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(failures)
+
+	var bound int
+	for i := range pairings {
+		if _, ok, err := container.For(fmt.Sprintf("sid-%d", i)).JID(ctx); err != nil {
+			t.Fatalf("JID: %v", err)
+		} else if ok {
+			bound++
+		}
+	}
+	if bound != 1 {
+		t.Fatalf("%d sessions hold the same account, want exactly 1", bound)
+	}
+}
+
+// The account index shipped non-unique, and `CREATE UNIQUE INDEX IF NOT EXISTS` under
+// the same name is a no-op against a database that already has it. An upgraded store
+// "There is no device" and "the device could not be read" are the same value out of a
+// lookup and opposite facts. Read as absence, a row this store cannot parse costs its
+// mapping the contest, and the winner is then the half-written one — so the upgrade
+// deletes the mapping of a session that was paired, over a device that was there all
+// along. The migration stops instead: the duplicates keep, and so does the account.
+func TestAnUpgradeStopsRatherThanGuessAtCredentialsItCannotRead(t *testing.T) {
+	t.Parallel()
+
+	target := storetest.New(t)
+
+	old, err := store.Open(t.Context(), target.URL, store.AlwaysOwned, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	db := old.DB()
+	if _, err := db.ExecContext(t.Context(), `DROP INDEX IF EXISTS wac_session_device_one_per_account`); err != nil {
+		t.Fatalf("drop the new index: %v", err)
+	}
+	if _, err := db.ExecContext(t.Context(),
+		`CREATE INDEX IF NOT EXISTS wac_session_device_account ON wac_session_device (account)`); err != nil {
+		t.Fatalf("recreate the old index: %v", err)
+	}
+
+	paired, err := types.ParseJID("5511999990001:1@s.whatsapp.net")
+	if err != nil {
+		t.Fatalf("ParseJID: %v", err)
+	}
+	device := old.Devices().NewDevice()
+	device.ID = &paired
+	device.Account = &waAdv.ADVSignedDeviceIdentity{
+		Details:             make([]byte, 32),
+		AccountSignature:    make([]byte, 64),
+		AccountSignatureKey: make([]byte, 32),
+		DeviceSignature:     make([]byte, 64),
+	}
+	if err := old.Devices().PutDevice(t.Context(), device); err != nil {
+		t.Fatalf("PutDevice: %v", err)
+	}
+	// The row is there and holds the credentials; what it will not do is come back out.
+	//
+	// Through `lid` rather than a column with a type behind it. whatsmeow declares
+	// facebook_uuid as `uuid`, which Postgres enforces and SQLite reads as a name it
+	// does not know, so writing junk into it is refused on one dialect and accepted on
+	// the other -- the test would then be about the write rather than about the read.
+	// `lid` is TEXT in both and is scanned through types.JID, which is where this fails
+	// on either.
+	if _, err := db.ExecContext(t.Context(), target.Rebind(
+		`UPDATE whatsmeow_device SET lid = '1.x@s.whatsapp.net' WHERE jid = ?`), paired.String()); err != nil {
+		t.Fatalf("make the device unreadable: %v", err)
+	}
+	if _, err := db.ExecContext(t.Context(), target.Rebind(
+		`INSERT INTO wac_session_device (sid, jid, account, bound_at) VALUES (?, ?, ?, ?)`),
+		"sid-paired", paired.String(), "5511999990001", int64(1)); err != nil {
+		t.Fatalf("write the paired mapping: %v", err)
+	}
+	if _, err := db.ExecContext(t.Context(), target.Rebind(
+		`INSERT INTO wac_session_device (sid, jid, account, bound_at) VALUES (?, ?, ?, ?)`),
+		"sid-halfway", "5511999990001:2@s.whatsapp.net", "5511999990001", int64(2)); err != nil {
+		t.Fatalf("write the half-written mapping: %v", err)
+	}
+	if err := old.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	upgraded, err := store.Open(t.Context(), target.URL, store.AlwaysOwned, zerolog.Nop())
+	if err == nil {
+		t.Cleanup(func() { _ = upgraded.Close() })
+		t.Fatal("the upgrade chose a winner while it could not tell whether the other had credentials")
+	}
+
+	// And it chose nothing on the way out: the mapping that names the device is still
+	// there, so a start once the store reads again finds the account where it left it.
+	check := target.Pool(t)
+	var mappings int
+	if err := check.QueryRowContext(t.Context(), target.Rebind(
+		`SELECT COUNT(*) FROM wac_session_device WHERE sid = ?`), "sid-paired").Scan(&mappings); err != nil {
+		t.Fatalf("count the mappings: %v", err)
+	}
+	if mappings != 1 {
+		t.Fatalf("the paired mapping was deleted on the way out (%d rows)", mappings)
+	}
+}
+
+// Bind writes the mapping before whatsmeow writes the device, so an instance that died
+// mid-pairing leaves the newest mapping of all pointing at a device that never existed.
+// Reading `bound_at` alone as "this is the pairing that took" then deletes the working
+// device to preserve the empty row, Device unbinds the survivor for having no
+// credentials, and an upgrade has made a paired account pair again.
+func TestAnUpgradeKeepsTheMappingThatStillHasItsCredentials(t *testing.T) {
+	t.Parallel()
+
+	target := storetest.New(t)
+
+	old, err := store.Open(t.Context(), target.URL, store.AlwaysOwned, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	db := old.DB()
+	if _, err := db.ExecContext(t.Context(), `DROP INDEX IF EXISTS wac_session_device_one_per_account`); err != nil {
+		t.Fatalf("drop the new index: %v", err)
+	}
+	if _, err := db.ExecContext(t.Context(),
+		`CREATE INDEX IF NOT EXISTS wac_session_device_account ON wac_session_device (account)`); err != nil {
+		t.Fatalf("recreate the old index: %v", err)
+	}
+
+	// The pairing that took, and the credentials whatsmeow wrote beside it.
+	paired, err := types.ParseJID("5511999990001:1@s.whatsapp.net")
+	if err != nil {
+		t.Fatalf("ParseJID: %v", err)
+	}
+	device := old.Devices().NewDevice()
+	device.ID = &paired
+	device.Account = &waAdv.ADVSignedDeviceIdentity{
+		Details:             make([]byte, 32),
+		AccountSignature:    make([]byte, 64),
+		AccountSignatureKey: make([]byte, 32),
+		DeviceSignature:     make([]byte, 64),
+	}
+	if err := old.Devices().PutDevice(t.Context(), device); err != nil {
+		t.Fatalf("PutDevice: %v", err)
+	}
+	if _, err := db.ExecContext(t.Context(), target.Rebind(
+		`INSERT INTO wac_session_device (sid, jid, account, bound_at) VALUES (?, ?, ?, ?)`),
+		"sid-paired", paired.String(), "5511999990001", int64(1)); err != nil {
+		t.Fatalf("write the paired mapping: %v", err)
+	}
+	// And the one that did not: newer, and with nothing behind it.
+	if _, err := db.ExecContext(t.Context(), target.Rebind(
+		`INSERT INTO wac_session_device (sid, jid, account, bound_at) VALUES (?, ?, ?, ?)`),
+		"sid-halfway", "5511999990001:2@s.whatsapp.net", "5511999990001", int64(2)); err != nil {
+		t.Fatalf("write the half-written mapping: %v", err)
+	}
+	if err := old.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	upgraded, err := store.Open(t.Context(), target.URL, store.AlwaysOwned, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() { _ = upgraded.Close() })
+
+	if _, bound, err := upgraded.For("sid-halfway").JID(t.Context()); err != nil || bound {
+		t.Fatalf("the mapping with no device behind it survived (bound=%v, err=%v)", bound, err)
+	}
+	if jid, bound, err := upgraded.For("sid-paired").JID(t.Context()); err != nil || !bound || jid != paired {
+		t.Fatalf("the paired mapping is gone (jid=%v, bound=%v, err=%v)", jid, bound, err)
+	}
+
+	// And its credentials with it, which is what makes the session resumable rather than
+	// a mapping Device unbinds on the next connect.
+	if stored, err := upgraded.Devices().GetDevice(t.Context(), paired); err != nil {
+		t.Fatalf("GetDevice: %v", err)
+	} else if stored == nil {
+		t.Fatal("the upgrade deleted the only device the account had")
+	}
+	resumed, err := upgraded.For("sid-paired").Device(t.Context())
+	if err != nil {
+		t.Fatalf("Device: %v", err)
+	}
+	if resumed.ID == nil || *resumed.ID != paired {
+		t.Fatalf("the session came back unpaired (%v), want %v", resumed.ID, paired)
+	}
+}
+
+// would keep the permissive index, never gain the constraint, and go on letting two
+// sessions hold one account while every test on a fresh database passed.
+func TestAnOlderStoreGainsTheAccountConstraint(t *testing.T) {
+	t.Parallel()
+
+	target := storetest.New(t)
+
+	// The shape the first version left behind: a permissive index, and two mappings for
+	// one account that it allowed through.
+	old, err := store.Open(t.Context(), target.URL, store.AlwaysOwned, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	db := old.DB()
+	if _, err := db.ExecContext(t.Context(), `DROP INDEX IF EXISTS wac_session_device_one_per_account`); err != nil {
+		t.Fatalf("drop the new index: %v", err)
+	}
+	if _, err := db.ExecContext(t.Context(),
+		`CREATE INDEX IF NOT EXISTS wac_session_device_account ON wac_session_device (account)`); err != nil {
+		t.Fatalf("recreate the old index: %v", err)
+	}
+	var stale types.JID
+	for i, sid := range []string{"sid-old", "sid-newer"} {
+		raw := fmt.Sprintf("5511999990001:%d@s.whatsapp.net", i+1)
+		jid, err := types.ParseJID(raw)
+		if err != nil {
+			t.Fatalf("ParseJID: %v", err)
+		}
+		if sid == "sid-old" {
+			stale = jid
+		}
+		// With the credentials whatsmeow keeps beside it, so the upgrade has something
+		// to leave behind if it only deletes the mapping.
+		device := old.Devices().NewDevice()
+		device.ID = &jid
+		device.Account = &waAdv.ADVSignedDeviceIdentity{
+			Details:             make([]byte, 32),
+			AccountSignature:    make([]byte, 64),
+			AccountSignatureKey: make([]byte, 32),
+			DeviceSignature:     make([]byte, 64),
+		}
+		if err := old.Devices().PutDevice(t.Context(), device); err != nil {
+			t.Fatalf("PutDevice: %v", err)
+		}
+		if _, err := db.ExecContext(t.Context(), target.Rebind(
+			`INSERT INTO wac_session_device (sid, jid, account, bound_at) VALUES (?, ?, ?, ?)`),
+			sid, raw, "5511999990001", int64(i+1)); err != nil {
+			t.Fatalf("write the duplicate mapping: %v", err)
+		}
+	}
+	if err := old.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Opened again by this version, which is what an upgrade is.
+	upgraded, err := store.Open(t.Context(), target.URL, store.AlwaysOwned, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() { _ = upgraded.Close() })
+
+	if _, bound, err := upgraded.For("sid-old").JID(t.Context()); err != nil || bound {
+		t.Fatalf("the older of two mappings survived (bound=%v, err=%v)", bound, err)
+	}
+	if _, bound, err := upgraded.For("sid-newer").JID(t.Context()); err != nil || !bound {
+		t.Fatalf("the mapping that should have been kept is gone (bound=%v, err=%v)", bound, err)
+	}
+
+	// The device the dropped mapping named goes with it. Nothing can reach it once its
+	// mapping is gone, so leaving it is leaving authentication material on disk that
+	// nothing will ever use or clean up.
+	if stored, err := upgraded.Devices().GetDevice(t.Context(), stale); err != nil {
+		t.Fatalf("GetDevice: %v", err)
+	} else if stored != nil {
+		t.Fatal("the device of the dropped mapping survived, unreachable and unclaimed")
+	}
+
+	// And the constraint is really there now, not merely named.
+	_, err = upgraded.DB().ExecContext(t.Context(), target.Rebind(
+		`INSERT INTO wac_session_device (sid, jid, account, bound_at) VALUES (?, ?, ?, ?)`),
+		"sid-third", "5511999990001:9@s.whatsapp.net", "5511999990001", 99)
+	if err == nil {
+		t.Fatal("a second mapping for one account was accepted after the upgrade")
+	}
+}
+
+// The save that ends a pairing is where whatsmeow installs the stores a fresh device does
+// not have yet, and it installs them over whatever was there. A fence that did not put
+// itself back would come off exactly once per account, at pairing, and stay off -- on the
+// sessions where nothing would look wrong.
+func TestPairingDoesNotTakeTheFenceOff(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+
+	fence := store.NewFence(func() bool { return true })
+	device := store.Fenced(container.Devices().NewDevice(), fence)
+	if device.Initialized {
+		t.Fatal("a device that has never been saved is already initialised, so this proves nothing")
+	}
+	jid := types.NewJID("5511999990001", types.DefaultUserServer)
+	jid.Device = 1
+	device.ID = &jid
+	// The half of pairing this test does not run: whatsmeow fills the account identity
+	// before it saves, and refuses to store a device without one.
+	device.Account = &waAdv.ADVSignedDeviceIdentity{
+		Details:             make([]byte, 32),
+		AccountSignature:    make([]byte, 64),
+		AccountSignatureKey: make([]byte, 32),
+		DeviceSignature:     make([]byte, 64),
+	}
+
+	if err := device.Save(t.Context()); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if !device.Initialized {
+		t.Fatal("the save left the device uninitialised, so whatsmeow no longer installs its stores here")
+	}
+
+	fence.Drop()
+	if err := device.Identities.PutIdentity(t.Context(), "5511999990002.0", [32]byte{}); !errors.Is(err, store.ErrNotOwned) {
+		t.Errorf("an identity was written after the fence came down: %v", err)
+	}
+	if err := device.Save(t.Context()); !errors.Is(err, store.ErrNotOwned) {
+		t.Errorf("the device itself was written after the fence came down: %v", err)
+	}
+}
+
+// Device reads, except for the one case where it writes: a mapping that points at a device
+// whatsmeow does not hold is cleared as no mapping at all. That shape is also what a session
+// taking over looks like for a moment, because Bind runs before the device is saved, so an
+// instance on its way out must not be the one to clear it.
+func TestAStoppedSessionDoesNotClearAMappingItFinds(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+
+	jid, err := types.ParseJID("5511999990001:3@" + types.DefaultUserServer)
+	if err != nil {
+		t.Fatalf("ParseJID: %v", err)
+	}
+	// Bound with no device behind it, which is what pairing looks like between the mapping
+	// and the save.
+	scoped := container.For("sid-taken-over")
+	if err := scoped.Bind(t.Context(), jid); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	scoped.Drop()
+	if _, err := scoped.Device(t.Context()); !errors.Is(err, store.ErrNotOwned) {
+		t.Fatalf("a session that stopped went looking and cleaned up: %v", err)
+	}
+
+	// And the mapping is still there for whoever it belongs to now.
+	if _, bound, err := container.For("sid-taken-over").JID(t.Context()); err != nil || !bound {
+		t.Fatalf("the mapping was cleared by the session that no longer owns it (bound=%v, err=%v)", bound, err)
+	}
+}
+
+// The second pass is only worth its minute if it is really the other dialect. A typo in
+// the variable, a url the helper stopped reading, or a fallback that quietly handed back
+// SQLite would each leave a green run that had executed the same statements twice, and
+// nothing else in the suite would notice: every test here passes on either dialect, which
+// is the whole design.
+//
+// What it cannot catch is CI not setting the variable at all: from inside the process
+// that is indistinguishable from a developer running `make test`. That half is the
+// workflow's, and it is one line in it.
+func TestTheSecondPassRunsAgainstTheOtherDialect(t *testing.T) {
+	t.Parallel()
+
+	if os.Getenv(storetest.AddressEnv) == "" {
+		t.Skipf("the SQLite pass; %s names the server for the other one", storetest.AddressEnv)
+	}
+
+	target := storetest.New(t)
+	if !target.Postgres() {
+		t.Fatalf("%s is set and the target is still SQLite (%q)", storetest.AddressEnv, target.URL)
+	}
+
+	// Asked of the server rather than of the helper, so this fails on a url that points
+	// somewhere unexpected as well as on one the helper mishandled. `version()` is
+	// Postgres's own -- SQLite spells it `sqlite_version()` -- so a wrong server is an
+	// error here rather than a surprising string.
+	container := openAt(t, target)
+	var version string
+	if err := container.DB().QueryRowContext(t.Context(), `SELECT version()`).Scan(&version); err != nil {
+		t.Fatalf("ask the server what it is: %v", err)
+	}
+	if !strings.HasPrefix(version, "PostgreSQL ") {
+		t.Fatalf("the second pass is talking to %q", version)
+	}
+}
+
+// A deployment upgrading into this has the table already, so `CREATE TABLE IF NOT
+// EXISTS` does nothing to it and the columns the re-upload request needs would never
+// appear. Every write to it would then fail on a column that is not there.
+//
+// Added rather than the table recreated, because its rows are what a client's
+// `message.download_media` reads: dropping them would lose the file of every message the
+// deployment received before the upgrade.
+func TestAStoreThatPredatesTheAddedMediaColumnsGainsThemAndKeepsItsRows(t *testing.T) {
+	t.Parallel()
+
+	target := storetest.New(t)
+	container := openAt(t, target)
+
+	// The shape this table had before, with a row in it the upgrade must not lose.
+	for _, statement := range []string{
+		`DROP TABLE wac_media_part`,
+		`CREATE TABLE wac_media_part (
+			sid             TEXT   NOT NULL,
+			message_id      TEXT   NOT NULL,
+			chat_kind       TEXT   NOT NULL,
+			chat_id         TEXT   NOT NULL,
+			kind            TEXT   NOT NULL,
+			direct_path     TEXT   NOT NULL,
+			media_key       TEXT   NOT NULL,
+			file_enc_sha256 TEXT   NOT NULL,
+			file_sha256     TEXT   NOT NULL,
+			file_length     BIGINT NOT NULL,
+			mime            TEXT   NOT NULL,
+			filename        TEXT   NOT NULL,
+			stored_at       BIGINT NOT NULL,
+			PRIMARY KEY (sid, message_id),
+			FOREIGN KEY (sid) REFERENCES wac_session_device (sid) ON DELETE CASCADE
+		)`,
+	} {
+		if _, err := container.DB().ExecContext(t.Context(), statement); err != nil {
+			t.Fatalf("put the old shape back: %v", err)
+		}
+	}
+	scoped := container.For("sid-old")
+	if err := scoped.Bind(t.Context(), types.NewJID("5511999990001", types.DefaultUserServer)); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	// Literal rather than bound, because the placeholders differ by dialect and the
+	// translation for that is the package's own and not exported.
+	if _, err := container.DB().ExecContext(t.Context(),
+		`INSERT INTO wac_media_part (sid, message_id, chat_kind, chat_id, kind, direct_path,
+			media_key, file_enc_sha256, file_sha256, file_length, mime, filename, stored_at)
+		 VALUES ('sid-old', '3EB0OLD', 'phone', '5511999990002', 'image', '/v/old', '', '', '', 7, 'image/jpeg', 'f.jpg', 1)`,
+	); err != nil {
+		t.Fatalf("write a row in the old shape: %v", err)
+	}
+	if err := container.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	upgraded := openAt(t, target)
+	kept, found, err := upgraded.For("sid-old").MediaPart(t.Context(), "3EB0OLD")
+	if err != nil {
+		t.Fatalf("MediaPart after the upgrade: %v", err)
+	}
+	if !found {
+		t.Fatal("the upgrade lost the row of a message whose file a client can still ask for")
+	}
+	if kept.DirectPath != "/v/old" {
+		t.Errorf("the row came back with direct path %q, want the one it was written with", kept.DirectPath)
+	}
+	if kept.ReceiptChat != "" || kept.Sender != "" || kept.FromMe || kept.BlobID != "" || kept.Rev != 0 {
+		t.Errorf("a row written before these were kept came back as chat %q, sender %q, from_me %v, blob %q, "+
+			"rev %d, want the empty ones and nought",
+			kept.ReceiptChat, kept.Sender, kept.FromMe, kept.BlobID, kept.Rev)
+	}
+
+	// And the columns take a write, which is what the old shape could not.
+	fresh := store.MediaPart{
+		MessageID: "3EB0NEW", ChatKind: "group", ChatID: "120363041234567890", Kind: "image",
+		DirectPath: "/v/new", Mime: "image/jpeg", Filename: "n.jpg", FileLength: 9,
+		ReceiptChat: "120363041234567890@g.us",
+		Sender:      "5511999990003@s.whatsapp.net", FromMe: true,
+		BlobID: "blob_0123456789abcdef01234567",
+	}
+	if err := upgraded.For("sid-old").PutMediaPart(t.Context(), &fresh, time.Now()); err != nil {
+		t.Fatalf("PutMediaPart after the upgrade: %v", err)
+	}
+	read, _, err := upgraded.For("sid-old").MediaPart(t.Context(), "3EB0NEW")
+	if err != nil {
+		t.Fatalf("MediaPart: %v", err)
+	}
+	if read.ReceiptChat != fresh.ReceiptChat || read.Sender != fresh.Sender || !read.FromMe ||
+		read.BlobID != fresh.BlobID {
+		t.Errorf("read back chat %q, sender %q, from_me %v, blob %q, want %q, %q, true and %q",
+			read.ReceiptChat, read.Sender, read.FromMe, read.BlobID,
+			fresh.ReceiptChat, fresh.Sender, fresh.BlobID)
+	}
+
+	// And the column the upgrade added takes the write that is made against a row that
+	// came from before it, which is how a deployment's cost falls off: each message that
+	// is asked for pays once more and then never again.
+	old, _, err := upgraded.For("sid-old").MediaPart(t.Context(), "3EB0OLD")
+	if err != nil {
+		t.Fatalf("MediaPart: %v", err)
+	}
+	if old.Rev != 0 {
+		t.Errorf("a row from the old shape came back at rev %d, want the nought it has never been written past", old.Rev)
+	}
+	if err := upgraded.For("sid-old").RememberBlob(t.Context(),
+		"blob_aaaaaaaaaaaaaaaaaaaaaaaa", &old); err != nil {
+		t.Fatalf("RememberBlob against a row from the old shape: %v", err)
+	}
+	remembered, _, err := upgraded.For("sid-old").MediaPart(t.Context(), "3EB0OLD")
+	if err != nil {
+		t.Fatalf("MediaPart after the write-back: %v", err)
+	}
+	if remembered.BlobID != "blob_aaaaaaaaaaaaaaaaaaaaaaaa" {
+		t.Errorf("the upgraded row points at %q, want the file the download wrote", remembered.BlobID)
+	}
+}
+
+// A rolling deploy starts the new instances alongside the old ones, so two of them can
+// find a column missing before either has added it. Asking first is not a lock: the one
+// that loses gets a duplicate-column error for work the other has already done, and
+// treated as a failure it refuses to start on a store that is perfectly fine.
+func TestTwoInstancesUpgradingAtOnceBothStart(t *testing.T) {
+	t.Parallel()
+
+	target := storetest.New(t)
+	container := openAt(t, target)
+	if _, err := container.DB().ExecContext(t.Context(),
+		`ALTER TABLE wac_media_part DROP COLUMN receipt_chat`); err != nil {
+		t.Fatalf("put the old shape back: %v", err)
+	}
+	if err := container.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Opened together, which is the whole point: one of them adds the column and the
+	// other has to find that acceptable.
+	var racing sync.WaitGroup
+	failures := make(chan error, 2)
+	for range 2 {
+		racing.Add(1)
+		go func() {
+			defer racing.Done()
+			opened, err := store.Open(context.Background(), target.URL, store.AlwaysOwned, zerolog.Nop())
+			if err != nil {
+				failures <- err
+				return
+			}
+			if err := opened.Close(); err != nil {
+				failures <- err
+			}
+		}()
+	}
+	racing.Wait()
+	close(failures)
+	for err := range failures {
+		t.Errorf("an instance refused to start on a store another was upgrading: %v", err)
+	}
+}
+
+// Several replicas of a fresh deployment start against a database nobody has opened yet,
+// and each of them creates the schema. `CREATE TABLE IF NOT EXISTS` is not safe against a
+// concurrent create of the same name under Postgres: both pass the check and the second
+// hits the unique index on `pg_type`, so before the first start was serialised one
+// replica out of two died on its first boot (#359). Several rounds, each on its own empty
+// database, because a single race is won by luck often enough to pass.
+func TestInstancesOpeningAnEmptyDatabaseAtOnceAllStart(t *testing.T) {
+	t.Parallel()
+	if !storetest.New(t).Postgres() {
+		t.Skip("a SQLite file is opened by one process; the race is between servers' sessions")
+	}
+
+	const instances, rounds = 4, 5
+	for round := range rounds {
+		target := storetest.New(t)
+		var racing sync.WaitGroup
+		failures := make(chan error, instances)
+		start := make(chan struct{})
+		for range instances {
+			racing.Add(1)
+			go func() {
+				defer racing.Done()
+				<-start
+				opened, err := store.Open(t.Context(), target.URL, store.AlwaysOwned, zerolog.Nop())
+				if err != nil {
+					failures <- err
+					return
+				}
+				if err := opened.Close(); err != nil {
+					failures <- err
+				}
+			}()
+		}
+		close(start)
+		racing.Wait()
+		close(failures)
+		for err := range failures {
+			t.Errorf("round %d: an instance refused to start on an empty database another was creating: %v", round, err)
+		}
+
+		// One version row per schema whatsmeow keeps: a second instance that ran the
+		// upgrade again after the first would have inserted its own.
+		var versions int
+		if err := target.Pool(t).QueryRowContext(t.Context(),
+			`SELECT count(*) FROM whatsmeow_version`).Scan(&versions); err != nil {
+			t.Fatalf("round %d: read whatsmeow_version: %v", round, err)
+		}
+		if versions != 1 {
+			t.Errorf("round %d: whatsmeow_version has %d rows, want 1", round, versions)
+		}
+	}
+}
+
+// A deployment can cap its pool at a single connection, and the turn-taking on the first
+// start must not need a second one from that pool: a lock held on the only pooled
+// connection would leave the upgrade it guards nothing to run on.
+func TestAPoolOfOneStillUpgradesAnEmptyDatabaseAlongsideAnotherInstance(t *testing.T) {
+	t.Parallel()
+	target := storetest.New(t)
+	if !target.Postgres() {
+		t.Skip("SQLite ignores MaxConns")
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	var racing sync.WaitGroup
+	failures := make(chan error, 2)
+	for range 2 {
+		racing.Add(1)
+		go func() {
+			defer racing.Done()
+			opened, err := store.OpenWith(ctx, target.URL, store.AlwaysOwned, zerolog.Nop(), store.Options{MaxConns: 1})
+			if err != nil {
+				failures <- err
+				return
+			}
+			if err := opened.Close(); err != nil {
+				failures <- err
+			}
+		}()
+	}
+	racing.Wait()
+	close(failures)
+	for err := range failures {
+		t.Errorf("an instance with a pool of one did not start: %v", err)
+	}
+}
+
+// An instance that waits for another one's first start is still bound by its own
+// deadline. Here the first instance is stuck inside the upgrade behind a schema create
+// somebody else holds open, and the second, waiting its turn, has to give up when the
+// deployment told it to rather than hang its readiness probe. Once the hold goes, the
+// first finishes as if nothing had happened.
+func TestAnInstanceWaitingItsTurnGivesUpAtItsDeadline(t *testing.T) {
+	t.Parallel()
+	target := storetest.New(t)
+	if !target.Postgres() {
+		t.Skip("SQLite has no other session to hold the schema")
+	}
+
+	pool := target.Pool(t)
+	holder, err := pool.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	t.Cleanup(func() { _ = holder.Rollback() })
+	if _, err := holder.ExecContext(t.Context(),
+		`CREATE TABLE whatsmeow_version (version INTEGER, compat INTEGER)`); err != nil {
+		t.Fatalf("hold the version table: %v", err)
+	}
+
+	first := make(chan error, 1)
+	go func() {
+		opened, err := store.Open(t.Context(), target.URL, store.AlwaysOwned, zerolog.Nop())
+		if err == nil {
+			err = opened.Close()
+		}
+		first <- err
+	}()
+	// The first instance is in the upgrade once a session of this database is waiting
+	// on a lock to create the version table.
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		var stuck int
+		if err := pool.QueryRowContext(t.Context(), `
+			SELECT count(*) FROM pg_stat_activity
+			WHERE datname = current_database() AND wait_event_type = 'Lock'
+			  AND query ILIKE '%whatsmeow_version%'`).Scan(&stuck); err != nil {
+			t.Fatalf("read pg_stat_activity: %v", err)
+		}
+		if stuck > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the first instance never reached the held schema create")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	began := time.Now()
+	opened, err := store.Open(ctx, target.URL, store.AlwaysOwned, zerolog.Nop())
+	if err == nil {
+		_ = opened.Close()
+		t.Fatal("the second instance opened while the first was still upgrading")
+	}
+	if took := time.Since(began); took > 10*time.Second {
+		t.Errorf("the second instance took %s to give up on a 2s deadline", took)
+	}
+
+	if err := holder.Rollback(); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+	if err := <-first; err != nil {
+		t.Errorf("the first instance did not finish once the hold went: %v", err)
+	}
+}
+
+// `information_schema.columns` filtered by table name alone spans every schema the role
+// can see, so a copy of this table in another schema answers for the one the writes land
+// in. Reported present on a table that has not got it, the migration skips the ALTER and
+// every write afterwards fails on a column that is not there.
+func TestAColumnInAnotherSchemaIsNotMistakenForThisOne(t *testing.T) {
+	t.Parallel()
+
+	target := storetest.New(t)
+	if target.URL == "" || !strings.HasPrefix(target.URL, "postgres") {
+		t.Skip("the schema search path is a Postgres question, and this pass is on SQLite")
+	}
+	container := openAt(t, target)
+	// A neighbour that already has the column, and this connector's own table without
+	// it. Only the second is what the writes reach.
+	for _, statement := range []string{
+		`CREATE SCHEMA IF NOT EXISTS neighbour`,
+		`CREATE TABLE neighbour.wac_media_part (receipt_chat TEXT NOT NULL DEFAULT '')`,
+		`ALTER TABLE wac_media_part DROP COLUMN receipt_chat`,
+	} {
+		if _, err := container.DB().ExecContext(t.Context(), statement); err != nil {
+			t.Fatalf("set the two schemas up: %v", err)
+		}
+	}
+	if err := container.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	upgraded := openAt(t, target)
+	scoped := upgraded.For("sid-neighbour")
+	if err := scoped.Bind(t.Context(), types.NewJID("5511999990001", types.DefaultUserServer)); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	part := store.MediaPart{
+		MessageID: "3EB0NEIGHBOUR", ChatKind: "phone", ChatID: "5511999990002", Kind: "image",
+		DirectPath: "/v/p", Mime: "image/jpeg", Filename: "n.jpg", FileLength: 3,
+		ReceiptChat: "5511999990002@s.whatsapp.net",
+	}
+	if err := scoped.PutMediaPart(t.Context(), &part, time.Now()); err != nil {
+		t.Fatalf("a write landed on a table the migration thought already had the column: %v", err)
+	}
+}
+
+// whatsmeow's upgrade asks `information_schema` whether its version table exists, by name
+// alone, and then reads it through `search_path`. A version table in a schema the path
+// does not reach is therefore "there" for the first question and missing for the second,
+// and the connector refused to start with `relation "whatsmeow_version" does not exist`,
+// which sends the reader looking for a table that plainly exists.
+func TestAVersionTableTheSearchPathDoesNotReachIsNamedRatherThanMissing(t *testing.T) {
+	t.Parallel()
+
+	target := storetest.New(t)
+	if !target.Postgres() {
+		t.Skip("the schema search path is a Postgres question, and this pass is on SQLite")
+	}
+	// Tables where a plain connect puts them, and a schema next to them with nothing.
+	container := openAt(t, target)
+	if _, err := container.DB().ExecContext(t.Context(), `CREATE SCHEMA IF NOT EXISTS elsewhere`); err != nil {
+		t.Fatalf("create the second schema: %v", err)
+	}
+	if err := container.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	through := func(path string) string {
+		separator := "?"
+		if strings.Contains(target.URL, "?") {
+			separator = "&"
+		}
+		return target.URL + separator + "search_path=" + path
+	}
+
+	t.Run("a path that does not reach the tables is refused, naming them", func(t *testing.T) {
+		opened, err := store.Open(t.Context(), through("elsewhere"), store.AlwaysOwned, zerolog.Nop())
+		if err == nil {
+			_ = opened.Close()
+			t.Fatal("opened through a search_path that reaches none of the tables")
+		}
+		for _, named := range []string{"whatsmeow_version", "public", "search_path", "elsewhere"} {
+			if !strings.Contains(err.Error(), named) {
+				t.Errorf("the refusal does not name %q: %v", named, err)
+			}
+		}
+		if strings.Contains(err.Error(), "does not exist") {
+			t.Errorf("the refusal still says the table does not exist: %v", err)
+		}
+		var created int
+		if err := target.Pool(t).QueryRowContext(t.Context(), `SELECT count(*) FROM information_schema.tables
+			WHERE table_schema = 'elsewhere' AND table_name LIKE 'whatsmeow%'`).Scan(&created); err != nil {
+			t.Fatalf("count what the refusal left behind: %v", err)
+		}
+		if created != 0 {
+			t.Errorf("the refusal left %d whatsmeow tables in the schema it refused", created)
+		}
+	})
+
+	// whatsmeow's own check reads `information_schema`, which shows a role only the tables
+	// it holds some privilege on. A role that cannot see the other schema's tables is
+	// therefore never misled, creates its own and starts, and a refusal that asked the
+	// catalogue instead would stop a deployment that works.
+	t.Run("a role that cannot see the other tables opens in its own schema", func(t *testing.T) {
+		role := fmt.Sprintf("wac_role_%d", time.Now().UnixNano())
+		admin := target.Pool(t)
+		for _, statement := range []string{
+			`CREATE ROLE ` + role + ` LOGIN PASSWORD 'p'`,
+			`CREATE SCHEMA ` + role + ` AUTHORIZATION ` + role,
+		} {
+			if _, err := admin.ExecContext(t.Context(), statement); err != nil {
+				t.Fatalf("set the role up: %v", err)
+			}
+		}
+		t.Cleanup(func() {
+			for _, statement := range []string{`DROP OWNED BY ` + role, `DROP ROLE ` + role} {
+				if _, err := admin.ExecContext(context.Background(), statement); err != nil {
+					t.Errorf("cleanup: %s: %v", statement, err)
+				}
+			}
+		})
+		// Its own schema first and `public` behind it, which is the default path for a role
+		// with a schema of its own name: the other tables are then visible by name,
+		// though the role can do nothing with them.
+		as, err := url.Parse(through(role + ",public"))
+		if err != nil {
+			t.Fatalf("parse %s: %v", storetest.AddressEnv, err)
+		}
+		as.User = url.UserPassword(role, "p")
+		opened, err := store.Open(t.Context(), as.String(), store.AlwaysOwned, zerolog.Nop())
+		if err != nil {
+			t.Fatalf("refused a role whose view of the database has no other version table: %v", err)
+		}
+		if err := opened.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+
+	// Through a later schema, behind one that does not exist. Behind `elsewhere`, which
+	// does, is a different defect: new tables would go there, and #331 refuses it.
+	t.Run("a path that reaches them through a later schema opens", func(t *testing.T) {
+		opened, err := store.Open(t.Context(), through("nowhere,public"), store.AlwaysOwned, zerolog.Nop())
+		if err != nil {
+			t.Fatalf("refused a search_path that reaches the tables: %v", err)
+		}
+		if err := opened.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+}
+
+// The connector's own tables are created with unqualified `CREATE TABLE IF NOT EXISTS`,
+// which lands in the first schema of `search_path` and only looks there. With a schema
+// put in front of the one that holds them, a start created a second, empty set and read
+// from it: a paired account came back unbound and unwanted, and the next connect would
+// pair it again while its device was still in the other schema.
+func TestTheConnectorsTablesAreNotSplitAcrossSchemas(t *testing.T) {
+	t.Parallel()
+
+	if os.Getenv(storetest.AddressEnv) == "" {
+		t.Skip("the schema search path is a Postgres question, and this pass is on SQLite")
+	}
+	// A database per case would be the tidy arrangement, and the mirror case needs one: it
+	// has to be built through a path that #278's check refuses while another schema holds
+	// whatsmeow's tables.
+	type database struct {
+		through func(path string) string
+		exec    func(statements ...string)
+		admin   *sql.DB
+	}
+	newDatabase := func(t *testing.T) database {
+		t.Helper()
+		target := storetest.New(t)
+		admin := target.Pool(t)
+		return database{
+			through: func(path string) string {
+				separator := "?"
+				if strings.Contains(target.URL, "?") {
+					separator = "&"
+				}
+				return target.URL + separator + "search_path=" + path
+			},
+			exec: func(statements ...string) {
+				t.Helper()
+				for _, statement := range statements {
+					if _, err := admin.ExecContext(t.Context(), statement); err != nil {
+						t.Fatalf("%s: %v", statement, err)
+					}
+				}
+			},
+			admin: admin,
+		}
+	}
+	relationsIn := func(t *testing.T, db database, schema string) int {
+		t.Helper()
+		var n int
+		if err := db.admin.QueryRowContext(t.Context(), `SELECT count(*) FROM pg_class c
+			JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1`, schema).Scan(&n); err != nil {
+			t.Fatalf("count the relations in %s: %v", schema, err)
+		}
+		return n
+	}
+	openThrough := func(t *testing.T, db database, path string) {
+		t.Helper()
+		opened, err := store.Open(t.Context(), db.through(path), store.AlwaysOwned, zerolog.Nop())
+		if err != nil {
+			t.Fatalf("open through %s: %v", path, err)
+		}
+		_ = opened.Close()
+	}
+	refused := func(t *testing.T, db database, path string, named ...string) {
+		t.Helper()
+		opened, err := store.Open(t.Context(), db.through(path), store.AlwaysOwned, zerolog.Nop())
+		if err == nil {
+			_ = opened.Close()
+			t.Fatalf("opened through search_path=%s, with the connector's tables split across two schemas", path)
+		}
+		for _, schema := range named {
+			if !strings.Contains(err.Error(), schema) {
+				t.Errorf("the refusal does not name %q: %v", schema, err)
+			}
+		}
+	}
+
+	// Everything in `holding`. Each case puts a schema of its own in front of it, so that
+	// a start the base lets through leaves nothing behind for the next case to trip on.
+	db := newDatabase(t)
+	db.exec(`CREATE SCHEMA holding`)
+	openThrough(t, db, "holding")
+
+	t.Run("an empty schema in front of the tables is refused, creating nothing in it", func(t *testing.T) {
+		db.exec(`CREATE SCHEMA front`)
+		refused(t, db, "front,holding", "front", "holding", "put holding first")
+		if n := relationsIn(t, db, "front"); n != 0 {
+			t.Errorf("the refusal left %d relations in the schema in front", n)
+		}
+	})
+
+	t.Run("a database an older start already split is refused too", func(t *testing.T) {
+		db.exec(`CREATE SCHEMA split`,
+			`CREATE TABLE split.wac_session_device (LIKE holding.wac_session_device INCLUDING ALL)`)
+		refused(t, db, "split,holding", "split", "holding", "put holding first")
+	})
+
+	t.Run("the connector's tables in front of whatsmeow's are refused", func(t *testing.T) {
+		// The mirror image: whatsmeow's tables are where new ones would go, and the
+		// connector's own are behind them, so a check on whatsmeow's alone passes it.
+		mirror := newDatabase(t)
+		mirror.exec(`CREATE SCHEMA mirror`)
+		openThrough(t, mirror, "mirror")
+		mirror.exec(`CREATE SCHEMA behind`, `ALTER TABLE mirror.wac_session_device SET SCHEMA behind`)
+		// And from both orders, with the same advice: reordering the path only moves the
+		// refusal from one table to the other, so the message cannot suggest it.
+		for _, path := range []string{"mirror,behind", "behind,mirror"} {
+			refused(t, mirror, path, "mirror", "behind", "move the store into one schema")
+		}
+	})
+
+	t.Run("a path that reaches every table in the schema it would create in opens", func(t *testing.T) {
+		for _, path := range []string{"holding", "nowhere,holding"} {
+			opened, err := store.Open(t.Context(), db.through(path), store.AlwaysOwned, zerolog.Nop())
+			if err != nil {
+				t.Fatalf("refused search_path=%s, which reaches every table in one schema: %v", path, err)
+			}
+			_ = opened.Close()
+		}
+	})
+}
+
+// leaseClock is the fleet's clock, driven by the test rather than by the wall.
+type leaseClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *leaseClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *leaseClock) advance(by time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(by)
+	c.mu.Unlock()
+}
+
+// The window this closes is the one between a lease running out and this instance
+// hearing about it. Nothing drops the fence in here: the renewal that would have said
+// `ErrNotOwner` has not run yet, so the old owner still believes the session is its own
+// while a peer has already taken it. Both write, and the loser's writes land on top of
+// what the winner has learned -- for the Signal state, on top of what the next message
+// is decrypted against.
+//
+// The lease can answer it without asking Redis, because it knows when it was last
+// renewed and for how long that is good, which is what `Owned` already gives the publish
+// path before it writes an event.
+//
+// Both halves of the store are checked, and the second is the one that matters: the
+// tables this package owns could be fenced with a column and a condition, but whatsmeow
+// builds its own statements and its tables are where the expensive writes are. Standing
+// in front of the device covers them without reaching into its SQL.
+func TestAWriteIsRefusedOnceTheLeaseHasRunOutEvenBeforeThisInstanceKnows(t *testing.T) {
+	t.Parallel()
+
+	const ttl = 30 * time.Second
+	for name, write := range map[string]func(context.Context, *store.Scoped) error{
+		"a table this package owns": func(ctx context.Context, scoped *store.Scoped) error {
+			jid := types.NewJID("5511999990002", types.DefaultUserServer)
+			jid.Device = uint16(deviceCounter.Add(1))
+			return scoped.Bind(ctx, jid)
+		},
+		"a table whatsmeow owns": func(ctx context.Context, scoped *store.Scoped) error {
+			device, err := scoped.Device(ctx)
+			if err != nil {
+				return err
+			}
+			// The write pairing itself makes, and the one a session repeats every time
+			// whatsmeow fills another field in. The rest of the device's stores are only
+			// wired up once it has been saved, so this is also the first one available.
+			jid := types.NewJID("5511999990002", types.DefaultUserServer)
+			jid.Device = uint16(deviceCounter.Add(1))
+			device.ID = &jid
+			device.Account = &waAdv.ADVSignedDeviceIdentity{
+				Details:             make([]byte, 32),
+				AccountSignature:    make([]byte, 64),
+				AccountSignatureKey: make([]byte, 32),
+				DeviceSignature:     make([]byte, 64),
+			}
+			return device.Save(ctx)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			clock := &leaseClock{now: time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)}
+			server := miniredis.RunT(t)
+			fleet := func(instance string) *cluster.Leases {
+				rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+				t.Cleanup(func() { _ = rdb.Close() })
+				return cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), instance,
+					cluster.Options{TTL: ttl, Clock: clock})
+			}
+			losing, winning := fleet("inst-a"), fleet("inst-b")
+
+			container, err := store.Open(t.Context(), storetest.New(t).URL, losing.Owns, zerolog.Nop())
+			if err != nil {
+				t.Fatalf("store.Open: %v", err)
+			}
+			t.Cleanup(func() { _ = container.Close() })
+
+			ctx := t.Context()
+			const sid = "2f1c6f0e-0000-4000-8000-00000000005a"
+			if _, err := losing.Acquire(ctx, sid); err != nil {
+				t.Fatalf("Acquire: %v", err)
+			}
+			scoped := container.For(sid)
+			if err := write(ctx, scoped); err != nil {
+				t.Fatalf("a write under a live lease was refused, so what follows proves nothing: %v", err)
+			}
+
+			// The renewal never runs. Redis lets the key go and the peer takes the
+			// account, which is the whole of what "lost it" means.
+			clock.advance(ttl)
+			server.FastForward(ttl)
+			if _, err := winning.Acquire(ctx, sid); err != nil {
+				t.Fatalf("the peer could not take a session whose lease ran out: %v", err)
+			}
+			if scoped.Dropped() {
+				t.Fatal("the fence was dropped, so this instance had been told and the window under test never happened")
+			}
+
+			if err := write(ctx, scoped); !errors.Is(err, store.ErrNotOwned) {
+				t.Fatalf("a write from the instance that lost the session answered %v, want ErrNotOwned", err)
+			}
+		})
+	}
+}
+
+// database/sql opens a connection per concurrent query and, left alone, stops at no
+// number: Postgres ships with `max_connections = 100` for the whole server, and reaching
+// it does not slow this connector down, it refuses connections to every other application
+// on that database. One pool per process is what makes a cap sufficient -- sessions do not
+// hold one each.
+func TestThePostgresPoolHasACeiling(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name        string
+		asked, want int
+	}{
+		{"a number the deployment asked for", 7, 7},
+		{"nothing asked for", 0, store.DefaultMaxConns},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			// A database of its own. Two of these upgrading one schema at the same time
+			// race on creating it, which is a failure about this test and not about the
+			// pool it is looking at.
+			target := storetest.New(t)
+			if !strings.HasPrefix(target.URL, "postgres") {
+				t.Skip("no Postgres to open a pool against")
+			}
+
+			container, err := store.OpenWith(t.Context(), target.URL, store.AlwaysOwned, zerolog.Nop(),
+				store.Options{MaxConns: tc.asked})
+			if err != nil {
+				t.Fatalf("OpenWith: %v", err)
+			}
+			t.Cleanup(func() { _ = container.Close() })
+
+			if got := container.DB().Stats().MaxOpenConnections; got != tc.want {
+				t.Fatalf("the pool tops out at %d, want %d", got, tc.want)
+			}
+		})
+	}
+
+	// A file holds one writer whatever the pool says, and handing out more connections
+	// than that converts waiting into `database is locked`. The cap above must not raise
+	// it back up.
+	t.Run("sqlite is still serialised whatever was asked for", func(t *testing.T) {
+		t.Parallel()
+
+		container, err := store.OpenWith(t.Context(), "sqlite:"+filepath.Join(t.TempDir(), "wa.db"),
+			store.AlwaysOwned, zerolog.Nop(), store.Options{MaxConns: 32})
+		if err != nil {
+			t.Fatalf("OpenWith: %v", err)
+		}
+		t.Cleanup(func() { _ = container.Close() })
+
+		if got := container.DB().Stats().MaxOpenConnections; got != 1 {
+			t.Fatalf("the file's pool tops out at %d, want 1", got)
+		}
+	})
+}
+
+// A store written by a build that had nowhere to record the subscription. Its rows are
+// the whole roster of a deployment upgrading into this, so losing them would leave every
+// paired account on the floor until somebody opened each inbox and pressed connect.
+//
+// They come back with groups off, and that is the choice rather than an accident of the
+// column default. Off is what the deployment already does -- a resumed session has never
+// carried the subscription -- and on would have an upgrade start publishing group
+// conversation into inboxes that never asked for it, which is the one outcome a client
+// cannot undo after the fact.
+func TestAnOlderStoreResumesItsSessionsWithoutGroups(t *testing.T) {
+	t.Parallel()
+
+	target := storetest.New(t)
+	old, err := store.Open(t.Context(), target.URL, store.AlwaysOwned, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	pair(t, old, "sid-old", "5511999990001")
+
+	// The shape the first version created: no column for what the connect asked to
+	// receive. Recreated rather than altered, because that is what the old build left.
+	db := old.DB()
+	if _, err := db.ExecContext(t.Context(), `DROP TABLE IF EXISTS wac_session_desired`); err != nil {
+		t.Fatalf("drop the new table: %v", err)
+	}
+	if _, err := db.ExecContext(t.Context(), `CREATE TABLE wac_session_desired (
+		sid      TEXT   PRIMARY KEY,
+		desired  TEXT   NOT NULL,
+		asked_at BIGINT NOT NULL
+	)`); err != nil {
+		t.Fatalf("recreate the old table: %v", err)
+	}
+	if _, err := db.ExecContext(t.Context(), target.Rebind(
+		`INSERT INTO wac_session_desired (sid, desired, asked_at) VALUES (?, ?, ?)`),
+		"sid-old", "connected", 1); err != nil {
+		t.Fatalf("write the row the old build would have: %v", err)
+	}
+
+	if err := old.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Opened again by this version, which is what an upgrade is.
+	upgraded := openAt(t, target)
+	wanted, err := upgraded.Wanted(t.Context())
+	if err != nil {
+		t.Fatalf("Wanted: %v", err)
+	}
+	if len(wanted) != 1 || wanted[0].SID != "sid-old" {
+		t.Fatalf("the upgrade lost the roster: the sweep would bring back %v", wanted)
+	}
+	if wanted[0].Groups {
+		t.Fatal("an upgrade turned group conversation on for a session whose client never asked for it")
+	}
+	// And direct, which is the only thing a session did before #217: the connect refused
+	// a proxy, so no row an older build wrote can stand for one.
+	if wanted[0].Proxy != "" {
+		t.Fatalf("an upgrade resumes a session through %q, which its client never asked for", wanted[0].Proxy)
+	}
+}

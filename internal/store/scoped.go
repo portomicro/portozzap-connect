@@ -1,0 +1,301 @@
+package store
+
+import (
+	"context"
+	"time"
+
+	"go.mau.fi/whatsmeow/store"
+	"go.mau.fi/whatsmeow/types"
+)
+
+// Scoped is this container as one session sees it: its own id, and the fence that says
+// whether this instance still owns it.
+//
+// It exists because the fence kept being forgotten. Three separate ways of getting a write
+// past it were found in review, and every one was a call site that did not know it had to
+// ask: the save that ends a pairing, the device a rebuild adopts, the mapping the pairing
+// callback writes. A fence a caller has to remember is a fence with as many holes as it has
+// callers, so the session-scoped writes moved behind one object that has the fence in it
+// and cannot be built without one.
+//
+// Reads are not fenced, here as everywhere: a session that lost its lease looking at its own
+// rows stops nothing, and refusing them would only turn a handover into a burst of errors on
+// the way out. Which call is a read is a judgement and not a naming rule, and Device is the
+// one that caught it out: it clears a mapping that points at a device nothing holds, and that
+// clearing is fenced even though nothing in the name says the call writes.
+type Scoped struct {
+	container *Container
+	sid       string
+	fence     *Fence
+}
+
+// For returns the container as the session named here sees it, with a fence of its own.
+//
+// One fence per session and not per device: a session outlives its devices -- a logout or a
+// mapping that went stale sends it back for another -- and what Close drops has to be the
+// one every device it ever built stood behind.
+//
+// Every call makes a fence, so a session takes one handle and keeps it. Two handles for one
+// session are two fences, and dropping one leaves the other up. That is also why this is not
+// memoised: a session reopened after losing its lease must not inherit the fence that was
+// dropped under it.
+func (c *Container) For(sid string) *Scoped {
+	return &Scoped{container: c, sid: sid, fence: NewFence(func() bool { return c.owned(sid) })}
+}
+
+// SID is the session this handle belongs to.
+func (s *Scoped) SID() string { return s.sid }
+
+// Drop fences every write from here on, including the ones the device makes.
+func (s *Scoped) Drop() { s.fence.Drop() }
+
+// Dropped reports whether the fence is down.
+func (s *Scoped) Dropped() bool { return s.fence.Dropped() }
+
+// Device returns the device this session should connect with, standing behind this session's
+// fence.
+//
+// Mostly a read, and refused outright when the fence is down and the mapping turns out to
+// point at a device that is not there: clearing that mapping is a write, and it is the new
+// owner's mapping by the time a handed-on session gets here.
+func (s *Scoped) Device(ctx context.Context) (*store.Device, error) {
+	return s.container.device(ctx, s.sid, s.fence)
+}
+
+// Bind records which device this session paired.
+func (s *Scoped) Bind(ctx context.Context, jid types.JID) error {
+	if err := s.fence.held(); err != nil {
+		return err
+	}
+	return s.container.bind(ctx, s.sid, jid)
+}
+
+// ForgetCredentials deletes this session's device and the mapping to it, and leaves what
+// its client asked for standing.
+//
+// For the caller repairing a session rather than ending one: the device is unusable and a
+// replacement has to be built, which cannot happen while the old row is still there, but
+// the client's request is untouched and the session should come back.
+//
+// There is deliberately no door that does this without saying which of the two it means.
+// The pair replaced a single `Forget` that always did both, and the call that wanted only
+// half of it was the one being written when #266 was fixed: a session layer that records
+// the request and then calls into an engine that drops it has built the defect it was
+// closing. A name that answers the question at the call site is the only thing that stops
+// the next caller getting it by accident; the fence over `PutDesired*` is what catches the
+// one after that.
+func (s *Scoped) ForgetCredentials(ctx context.Context) error {
+	if err := s.fence.held(); err != nil {
+		return err
+	}
+	return s.container.forget(ctx, s.sid, false)
+}
+
+// ForgetCredentialsAndDesired does the same and also forgets what the client asked for.
+//
+// For the caller ending a session: a logout, a delete, or an account WhatsApp has taken
+// away. Leaving the request behind would have the resume sweep bringing back an account
+// whose credentials this very call is deleting, every pass, for as long as the row lives.
+func (s *Scoped) ForgetCredentialsAndDesired(ctx context.Context) error {
+	if err := s.fence.held(); err != nil {
+		return err
+	}
+	return s.container.forget(ctx, s.sid, true)
+}
+
+// JID is the device this session paired, if it has paired.
+func (s *Scoped) JID(ctx context.Context) (types.JID, bool, error) {
+	return s.container.jid(ctx, s.sid)
+}
+
+// PutMediaPart keeps the coordinates a message's file can be fetched again from.
+//
+// The session on the row is this handle's, whatever the caller put there. A part carries a
+// session of its own because that is the shape of the table, and a caller free to fill it in
+// is a caller free to file one session's file under another's.
+func (s *Scoped) PutMediaPart(ctx context.Context, part *MediaPart, now time.Time) error {
+	if err := s.fence.held(); err != nil {
+		return err
+	}
+	kept := *part
+	kept.SID = s.sid
+	return s.container.putMediaPart(ctx, &kept, now)
+}
+
+// KeepMediaPart is PutMediaPart for a message whose row, if it has one, stays as it is,
+// written only while the session is bound to device, the one the dump reached.
+func (s *Scoped) KeepMediaPart(ctx context.Context, part *MediaPart, device string, now time.Time) error {
+	if err := s.fence.held(); err != nil {
+		return err
+	}
+	kept := *part
+	kept.SID = s.sid
+	return s.container.keepMediaPart(ctx, &kept, device, now)
+}
+
+// RefreshDirectPath replaces where a message's file is fetched from, and only while the
+// row is still the one the caller read.
+func (s *Scoped) RefreshDirectPath(ctx context.Context, messageID, path string, unchangedSince int64) error {
+	if err := s.fence.held(); err != nil {
+		return err
+	}
+	return s.container.refreshDirectPath(ctx, s.sid, messageID, path, unchangedSince)
+}
+
+// RememberBlob records which blob on this instance's disk holds a message's file, and
+// only while the row is still the one the caller read.
+//
+// `read` is the row as MediaPart handed it back, which is what the condition is built
+// from: a write-back is only ever valid for the row whose coordinates the download
+// actually used.
+func (s *Scoped) RememberBlob(ctx context.Context, blobID string, read *MediaPart) error {
+	if err := s.fence.held(); err != nil {
+		return err
+	}
+	return s.container.rememberBlob(ctx, s.sid, blobID, read)
+}
+
+// MediaPart reads back what PutMediaPart kept for one message.
+func (s *Scoped) MediaPart(ctx context.Context, messageID string) (MediaPart, bool, error) {
+	return s.container.mediaPart(ctx, s.sid, messageID)
+}
+
+// PutAvailability records what this account was last asked to be shown as, so the next
+// connection can put it back -- including the first connection of a new owner, whose
+// session has never heard the command.
+func (s *Scoped) PutAvailability(ctx context.Context, state string) error {
+	if err := s.fence.held(); err != nil {
+		return err
+	}
+	return s.container.putAvailability(ctx, s.sid, state, time.Now())
+}
+
+// Availability is what PutAvailability kept, and whether anything was kept at all.
+//
+// Not fenced, the way JID is not: it is a read, and a session about to be told what to
+// put back is one that is starting rather than one that has lost the account.
+func (s *Scoped) Availability(ctx context.Context) (state string, kept bool, err error) {
+	return s.container.availability(ctx, s.sid)
+}
+
+// PutDesiredConnected records that the client asked this session to be connected, and
+// which traffic it asked for while it is, so that an instance which comes up later can
+// put back the session that was asked for rather than half of it.
+//
+// Fenced like every other write from here: an instance that has lost the account must not
+// be the one saying what should happen to it. The two writers are the two commands that
+// say it, this one and PutDesiredDisconnected, and the deletion is the forget, which is
+// what a logout and a teardown both end in.
+//
+// A door per command rather than one that takes the state as a string: only one of the
+// two carries a subscription, and a single door would let a caller record a connection
+// without one -- which is the state this issue was, a session brought back deaf to the
+// groups its client asked for.
+//
+// What it carries is a struct and not a pair of bools, so that a switch added to the
+// connect is added here by name rather than by position: two flags that are both off by
+// default swap silently at a call site and compile.
+func (s *Scoped) PutDesiredConnected(ctx context.Context, wants Wants) error {
+	if err := s.fence.held(); err != nil {
+		return err
+	}
+	return s.container.putDesiredConnected(ctx, s.sid, wants, time.Now())
+}
+
+// Standing is what the client last asked this session to be connected with, and whether
+// anybody has asked about it at all. A session turned off still has one: a disconnect
+// says the session should be down, not that its client stopped wanting the proxy it
+// named, and the next thing that opens a socket for it goes out the way it was asked to.
+//
+// Read by whoever takes the session over without a connect in hand. A `session.wake`
+// brings an account up on an instance that never saw the connect behind it, and the next
+// command may be one that opens a socket without carrying a request of its own -- a
+// pairing code. What that socket goes out through is this, and a default in its place
+// would be a session that asked for a proxy dialling WhatsApp directly.
+//
+// Not fenced: it reads, and what it reads was written behind the fence.
+func (s *Scoped) Standing(ctx context.Context) (Wants, bool, error) {
+	return s.container.standing(ctx, s.sid)
+}
+
+// Wanted is WantedSession for this session: what its client asked for, and whether it
+// is an account the sweep would bring back. Read by the connect the connector synthesises
+// for itself, when it runs, so it acts on the request as it stands then.
+//
+// Not fenced: it reads.
+func (s *Scoped) Wanted(ctx context.Context) (Wants, bool, error) {
+	return s.container.WantedSession(ctx, s.sid)
+}
+
+// PutDesiredDisconnected records that the client asked this session to stay down.
+//
+// Fenced for the same reason as the one above, and carrying no subscription because the
+// command it serves does not: see putDesiredDisconnected.
+func (s *Scoped) PutDesiredDisconnected(ctx context.Context) error {
+	if err := s.fence.held(); err != nil {
+		return err
+	}
+	return s.container.putDesiredDisconnected(ctx, s.sid, time.Now())
+}
+
+// PutPlaceholder holds a bubble this session has scheduled and not yet decided, so a
+// process that ends inside the window does not take the decision with it.
+//
+// Fenced: the row is read by whichever instance picks the session up next, and a write
+// from an instance that has lost the session would hand its successor a bubble for a
+// message that has already been answered somewhere else. A placeholder published for a
+// message that did arrive is permanent, because the client deduplicates on the id.
+func (s *Scoped) PutPlaceholder(ctx context.Context, held *Placeholder) error {
+	if err := s.fence.held(); err != nil {
+		return err
+	}
+	waiting := *held
+	waiting.SID = s.sid
+	return s.container.putPlaceholder(ctx, &waiting)
+}
+
+// DropPlaceholder forgets a bubble that has been decided, whichever way it went.
+//
+// Fenced like the write. Deleting somebody else's row is how a bubble goes missing on
+// the very handoff this exists to survive.
+func (s *Scoped) DropPlaceholder(ctx context.Context, messageID string) error {
+	if err := s.fence.held(); err != nil {
+		return err
+	}
+	return s.container.dropPlaceholder(ctx, s.sid, messageID)
+}
+
+// Placeholders lists the bubbles this session left undecided, oldest deadline first.
+func (s *Scoped) Placeholders(ctx context.Context) ([]Placeholder, error) {
+	return s.container.placeholders(ctx, s.sid)
+}
+
+// PutPendingHistory writes down a history dump this session was announced, before anything
+// is done with it, so a dump that does not finish is not a dump that is lost.
+//
+// Fenced like a placeholder: the row is read by whoever owns the session next.
+func (s *Scoped) PutPendingHistory(ctx context.Context, held *PendingHistory) error {
+	if err := s.fence.held(); err != nil {
+		return err
+	}
+	pending := *held
+	pending.SID = s.sid
+	return s.container.putPendingHistory(ctx, &pending)
+}
+
+// DropPendingHistory forgets a dump that is finished with: published and receipted, or
+// handed back to the phone to upload again.
+//
+// Fenced like the write: a session that lost the account deleting the row would take the
+// dump away from the owner that has to finish it.
+func (s *Scoped) DropPendingHistory(ctx context.Context, messageID string) error {
+	if err := s.fence.held(); err != nil {
+		return err
+	}
+	return s.container.dropPendingHistory(ctx, s.sid, messageID)
+}
+
+// PendingHistory lists the dumps this session has not finished with, oldest first.
+func (s *Scoped) PendingHistory(ctx context.Context) ([]PendingHistory, error) {
+	return s.container.pendingHistory(ctx, s.sid)
+}

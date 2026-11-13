@@ -1,0 +1,422 @@
+package store
+
+import (
+	"context"
+	"database/sql"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"time"
+)
+
+// MediaPart is what it takes to fetch the file of a message a second time.
+//
+// A blob is instance-local and time-bounded, so the reference published with an event
+// stops working: the instance that downloaded it is replaced, or the cache drops it.
+// The client's answer to that is to ask for the file again, and answering needs what
+// WhatsApp wants in order to hand the same file over, which is nowhere else once the
+// event has been published and the message forgotten.
+//
+// The fields are named one by one rather than kept as the message whatsmeow decoded.
+// That message carries the caption, the preview and whoever was mentioned, and none of
+// that is needed to fetch anything: writing the file's coordinates and nothing else is
+// what keeps the contents of a conversation out of this table by construction rather
+// than by a call to strip them that somebody has to remember.
+type MediaPart struct {
+	SID       string
+	MessageID string
+	// ChatKind and ChatID are the chat the message was published under. They are not
+	// part of the key -- see PutMediaPart for why -- and they are here so a lookup can
+	// tell that the row it found belongs to a different conversation than the one asking
+	// for it, and refuse rather than hand over somebody else's file.
+	ChatKind string
+	ChatID   string
+
+	// AltChatKind and AltChatID are the other address the message was published under, when
+	// a history dump named its chat differently from the first publication: the number the
+	// live message went out under, and the LID the dump carries. A client asking for the
+	// file under either is asking about the same conversation, and the in-memory pairing
+	// that would say so does not survive a restart or a handoff. Empty when there is none.
+	AltChatKind string
+	AltChatID   string
+	// Kind is the contract's media kind, and it decides which of whatsmeow's message
+	// types the download is rebuilt as, which is how whatsmeow knows the media type.
+	Kind string
+
+	DirectPath    string
+	MediaKey      []byte
+	FileEncSHA256 []byte
+	FileSHA256    []byte
+	FileLength    int64
+
+	Mime     string
+	Filename string
+
+	// ReceiptChat, Sender and FromMe are what a request to upload the file again is
+	// addressed with, once WhatsApp has dropped it off its CDN. None of them is needed
+	// to download it.
+	//
+	// ReceiptChat is the raw JID the message was sent to, which is not ChatKind and
+	// ChatID: those are what it was published under, and for a broadcast the two differ
+	// on purpose. All three are empty on a row written before they were kept, and such a
+	// row cannot be asked about at all.
+	ReceiptChat string
+	Sender      string
+	FromMe      bool
+
+	// Rev counts how many times this row has been written, and it is what a caller that
+	// read the row and went away for a while checks it against. Nothing else here is an
+	// identity: the chat and the coordinates can be the same for two different files
+	// under one id, media that is not encrypted carries no digests at all, and StoredAt
+	// has millisecond resolution and admits a tie on purpose. Set by PutMediaPart.
+	Rev int64
+
+	// BlobID is the file this instance already has for this message, and it is empty
+	// when there is none: a row written before the column existed, a message whose file
+	// never arrived, or one whose blob has since been swept.
+	//
+	// It is a hint and never an answer. The blob it names lives on the disk of whichever
+	// instance wrote it and is dropped on its own schedule, so a reader has to ask its
+	// own store whether the file is there rather than believe the row -- see
+	// RememberBlob for what keeps the two from drifting apart in the first place.
+	BlobID string
+
+	// StoredAt is when the part was written, in milliseconds, and it is what the sweep
+	// reads. Set by PutMediaPart.
+	StoredAt int64
+}
+
+// PutMediaPart records how to fetch a message's file again, replacing whatever was
+// there for the same message.
+//
+// The newest write wins, and the WHERE is what makes that true rather than "whichever
+// statement ran last". A message that arrives twice is the same file both times and the
+// later delivery carries the fresher coordinates, so an older write landing afterwards
+// has nothing to add and can only take something away.
+//
+// The key is the session and the message, and the chat is a column rather than part of
+// it. Making it part of the key would give a message id in two chats a row each, and the
+// client's own command makes `chat` optional -- so a lookup arriving without one would
+// have two rows to choose between and no way to choose. Kept as a column, a lookup that
+// does bring a chat can tell it found somebody else's row and refuse; one that does not
+// is no worse off than before.
+//
+// That case is not hypothetical: ownership of a session moves between instances, and the
+// old owner's handler can still be inside this call when the new one writes. Fencing such
+// a write is not this guard's job: Scoped.PutMediaPart asks the fence before reaching
+// here, so one from an instance that has lost the lease is refused before a statement is
+// built. What is left for the stamp is the reordering of two writes that were both
+// entitled to be here when they started. The fence stops answering yes at
+// `renewedAt + ttl - margin`, a whole margin before the claim expires in Redis, and that
+// margin is what a write admitted just inside the cutoff has to commit in; one that takes
+// longer lands after the new owner's. The harm of that is a stale directPath installed
+// over a fresh one and a later download answered with a 404.
+//
+// The comparison admits an equal stamp, and that is not a rounding of the rule. The stamp
+// has millisecond resolution, so two writes inside one millisecond are not ordered by it
+// at all: rejecting the second discards a write nothing showed to be older, silently and
+// with no error to read, and a caller that writes a row and then corrects it loses the
+// correction whenever the two land in the same millisecond. Admitting it makes the later
+// call win, which is what an upsert without a guard would do and the only tie-break the
+// stamp supports. What the guard still refuses is a stamp measurably older, which is the
+// reordering it was written for.
+func (c *Container) putMediaPart(ctx context.Context, part *MediaPart, now time.Time) error {
+	if part.SID == "" || part.MessageID == "" {
+		return fmt.Errorf("store: a media part needs a session and a message, got %q and %q", part.SID, part.MessageID)
+	}
+	// The caller's StoredAt is ignored rather than read: when a row was written is this
+	// package's to say, because it is the only thing the retention sweep goes by.
+	stamp := now.UnixMilli()
+
+	const upsert = `
+		INSERT INTO wac_media_part
+			(sid, message_id, chat_kind, chat_id, kind, direct_path, media_key,
+			 file_enc_sha256, file_sha256, file_length, mime, filename,
+			 receipt_chat, sender, from_me, blob_id, stored_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		-- rev is left to its default on the way in and bumped on the way through, so it
+		-- counts writes rather than being something a caller can hand in wrong.
+		ON CONFLICT (sid, message_id) DO UPDATE SET
+			-- A second address belongs to the chat it was recorded beside. A row taken over
+			-- by another chat under the same id loses it, or a download naming the old
+			-- chat's other address would be served the new chat's file.
+			alt_chat_kind = CASE WHEN wac_media_part.chat_kind = excluded.chat_kind AND wac_media_part.chat_id = excluded.chat_id
+				THEN wac_media_part.alt_chat_kind ELSE '' END,
+			alt_chat_id = CASE WHEN wac_media_part.chat_kind = excluded.chat_kind AND wac_media_part.chat_id = excluded.chat_id
+				THEN wac_media_part.alt_chat_id ELSE '' END,
+			chat_kind = excluded.chat_kind, chat_id = excluded.chat_id,
+			kind = excluded.kind, direct_path = excluded.direct_path, media_key = excluded.media_key,
+			file_enc_sha256 = excluded.file_enc_sha256, file_sha256 = excluded.file_sha256,
+			file_length = excluded.file_length, mime = excluded.mime, filename = excluded.filename,
+			receipt_chat = excluded.receipt_chat,
+			sender = excluded.sender, from_me = excluded.from_me,
+			blob_id = excluded.blob_id, stored_at = excluded.stored_at,
+			rev = wac_media_part.rev + 1
+		WHERE excluded.stored_at >= wac_media_part.stored_at`
+	_, err := c.db.ExecContext(ctx, c.rebind(upsert),
+		part.SID, part.MessageID, part.ChatKind, part.ChatID, part.Kind, part.DirectPath,
+		encode(part.MediaKey), encode(part.FileEncSHA256), encode(part.FileSHA256),
+		part.FileLength, part.Mime, part.Filename,
+		part.ReceiptChat, part.Sender, asFlag(part.FromMe), part.BlobID, stamp)
+	if err != nil {
+		return fmt.Errorf("store: record how to fetch the file of %s: %w", part.MessageID, err)
+	}
+	return nil
+}
+
+// keepMediaPart writes a row only where the message has none, and otherwise only renews
+// how long the row is kept and, when the caller names one in AltChatKind and AltChatID,
+// records a second address for the chat beside the first. Which address is the same chat
+// is the caller's to establish: a message id is chosen by the sender, and two chats can hold
+// one, so a differing chat on its own is no evidence of anything. The caller names in
+// ChatKind and ChatID the first address it checked the second against, and the second is
+// recorded only while the row still carries that one: a live write for another chat under
+// the same id can take the row over between the check and this write.
+//
+// For a message that arrives a second time, out of a history dump: what was kept the
+// first time may name the file on this instance's disk, and the dump's copy cannot. The
+// retention is renewed all the same, because the dump has just published the message
+// again with no reference of its own, and a row the sweep takes right after is a file the
+// client was just shown and cannot fetch.
+//
+// Nothing is written unless the session is still bound to device, checked in the same
+// statement: a dump retried across a logout and a new pairing would otherwise file the
+// previous account's media keys under the next account, which could then download them.
+func (c *Container) keepMediaPart(ctx context.Context, part *MediaPart, device string, now time.Time) error {
+	if part.SID == "" || part.MessageID == "" {
+		return fmt.Errorf("store: a media part needs a session and a message, got %q and %q", part.SID, part.MessageID)
+	}
+	const insert = `
+		INSERT INTO wac_media_part
+			(sid, message_id, chat_kind, chat_id, alt_chat_kind, alt_chat_id, kind, direct_path,
+			 media_key, file_enc_sha256, file_sha256, file_length, mime, filename,
+			 receipt_chat, sender, from_me, blob_id, stored_at)
+		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+		WHERE EXISTS (SELECT 1 FROM wac_session_device WHERE sid = ? AND jid = ?)
+		ON CONFLICT (sid, message_id) DO UPDATE SET stored_at = excluded.stored_at,
+			alt_chat_kind = CASE WHEN excluded.alt_chat_id <> ''
+				AND wac_media_part.chat_kind = excluded.chat_kind AND wac_media_part.chat_id = excluded.chat_id
+				THEN excluded.alt_chat_kind ELSE wac_media_part.alt_chat_kind END,
+			alt_chat_id = CASE WHEN excluded.alt_chat_id <> ''
+				AND wac_media_part.chat_kind = excluded.chat_kind AND wac_media_part.chat_id = excluded.chat_id
+				THEN excluded.alt_chat_id ELSE wac_media_part.alt_chat_id END
+		WHERE excluded.stored_at >= wac_media_part.stored_at`
+	_, err := c.db.ExecContext(ctx, c.rebind(insert),
+		part.SID, part.MessageID, part.ChatKind, part.ChatID, part.AltChatKind, part.AltChatID,
+		part.Kind, part.DirectPath,
+		encode(part.MediaKey), encode(part.FileEncSHA256), encode(part.FileSHA256),
+		part.FileLength, part.Mime, part.Filename,
+		part.ReceiptChat, part.Sender, asFlag(part.FromMe), part.BlobID, now.UnixMilli(),
+		part.SID, device)
+	if err != nil {
+		return fmt.Errorf("store: record how to fetch the file of %s: %w", part.MessageID, err)
+	}
+	return nil
+}
+
+// MediaPart reads back how to fetch one message's file, and whether anything was kept
+// for it at all.
+func (c *Container) mediaPart(ctx context.Context, sid, messageID string) (MediaPart, bool, error) {
+	const query = `
+		SELECT chat_kind, chat_id, alt_chat_kind, alt_chat_id, kind, direct_path, media_key,
+		       file_enc_sha256, file_sha256, file_length, mime, filename, receipt_chat, sender,
+		       from_me, blob_id, rev, stored_at
+		FROM wac_media_part WHERE sid = ? AND message_id = ?`
+
+	part := MediaPart{SID: sid, MessageID: messageID}
+	var key, encDigest, digest string
+	var fromMe int64
+	err := c.db.QueryRowContext(ctx, c.rebind(query), sid, messageID).Scan(
+		&part.ChatKind, &part.ChatID, &part.AltChatKind, &part.AltChatID,
+		&part.Kind, &part.DirectPath, &key, &encDigest, &digest,
+		&part.FileLength, &part.Mime, &part.Filename,
+		&part.ReceiptChat, &part.Sender, &fromMe, &part.BlobID, &part.Rev, &part.StoredAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return MediaPart{}, false, nil
+	}
+	if err != nil {
+		return MediaPart{}, false, fmt.Errorf("store: read how to fetch the file of %s: %w", messageID, err)
+	}
+	part.FromMe = fromMe != 0
+
+	for _, field := range []struct {
+		raw  string
+		into *[]byte
+		name string
+	}{
+		{key, &part.MediaKey, "media key"},
+		{encDigest, &part.FileEncSHA256, "ciphertext digest"},
+		{digest, &part.FileSHA256, "file digest"},
+	} {
+		decoded, err := decode(field.raw)
+		if err != nil {
+			// A row we wrote that we cannot read back is corruption. Reported rather
+			// than treated as a message nobody kept anything for, because the two ask
+			// for different things: one is a file that is gone, the other is a store
+			// that needs looking at.
+			return MediaPart{}, false, fmt.Errorf(
+				"store: the %s kept for %s is unreadable: %w", field.name, messageID, err)
+		}
+		*field.into = decoded
+	}
+	return part, true, nil
+}
+
+// mediaSweepBatch is how many rows one delete takes. Small enough that the pause it
+// puts on the rest of the store is short, large enough that a week of a busy account is
+// a handful of statements rather than a thousand.
+const mediaSweepBatch = 500
+
+// SweepMediaParts drops what was kept for messages older than the cutoff, and reports
+// how many rows went.
+//
+// The table would otherwise grow for the life of the deployment: a row per media message
+// ever received, each one holding the key to a file. The cutoff is a retention decision
+// rather than a cache one -- see MediaRefetch in the app config for why it is the length
+// it is.
+func (c *Container) SweepMediaParts(ctx context.Context, before time.Time) (int64, error) {
+	var dropped int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return dropped, err
+		}
+		// One batch per statement, rather than the backlog in one. On SQLite the whole
+		// connector shares a single connection, so a delete is not something the rest of
+		// the process waits out politely: an instance coming back after a long outage
+		// sweeps on its way in, which is exactly when sessions are being adopted on a
+		// five-second budget, and a backlog large enough to outlast it would fail the
+		// adoption and publish media with nothing filed to fetch it again. Batching is
+		// the whole fix and a deadline is not needed on top of it: the pool hands the
+		// connection to the waiter that queued first, so work that arrives mid-sweep is
+		// served in the gap between two statements instead of after all of them.
+		//
+		// Written as a subquery because neither dialect takes a LIMIT on DELETE itself,
+		// and the row-value IN below is the form both of them do take.
+		result, err := c.db.ExecContext(ctx, c.rebind(
+			`DELETE FROM wac_media_part WHERE (sid, message_id) IN (
+                            SELECT sid, message_id FROM wac_media_part WHERE stored_at < ? LIMIT ?)`),
+			before.UnixMilli(), mediaSweepBatch)
+		if err != nil {
+			return dropped, fmt.Errorf("store: drop the media parts kept past their retention: %w", err)
+		}
+		batch, err := result.RowsAffected()
+		if err != nil {
+			// The delete went through; only the count did not come back. Both drivers
+			// this connector uses report it, and the interface allows not to, so a sweep
+			// that worked is not turned into a failure over how much it says it did.
+			// It does end the pass, though: without a count there is no way to tell a
+			// batch that emptied the backlog from one that filled itself, and looping on
+			// the guess is how this becomes a delete that never returns. Whatever is
+			// left waits for the next tick.
+			return dropped, nil //nolint:nilerr // the statement succeeded, only its count is missing
+		}
+		dropped += batch
+		if batch < mediaSweepBatch {
+			return dropped, nil
+		}
+	}
+}
+
+// Keys and digests are kept base64 rather than as bytes: the column is then TEXT in both
+// dialects, which spares the schema and the driver round trip a difference that buys
+// nothing here. Three fields of 32 bytes each is not a size worth a dialect for.
+func encode(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	return base64.StdEncoding.EncodeToString(raw)
+}
+
+func decode(raw string) ([]byte, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	return base64.StdEncoding.DecodeString(raw)
+}
+
+// sentBy is a boolean as this table spells one. The column is a BIGINT because the two
+// dialects disagree about how to write a boolean, and every other column here is already
+// the same type in both.
+func asFlag(set bool) int64 {
+	if set {
+		return 1
+	}
+	return 0
+}
+
+// refreshDirectPath replaces the path a message's file is fetched from, and only while
+// the row is still the one the caller read.
+//
+// Conditional, and that is the whole of it. The caller has been waiting on somebody
+// else's phone for as long as thirty seconds, and an inbound handler can have written a
+// newer row for the same message in that time -- a redelivery, or a sender reusing an id
+// in another chat. Written back as a whole row it would put the older snapshot's chat and
+// coordinates over the newer ones, and a later download would serve the wrong file.
+//
+// `stored_at` is left alone rather than bumped. What changed is where the file is
+// fetched from, not when the message was received, and the retention sweep goes by the
+// second: refreshing a path is not a reason for a row to live longer.
+// rememberBlob records the file this instance now has for a message, and only while the
+// row is still the one the caller read.
+//
+// Conditional for the same reason refreshDirectPath is, and it is the more dangerous of
+// the two. The caller has been inside a download for as long as the media timeout allows,
+// and an inbound handler can have replaced the row in that time -- a redelivery, or a
+// sender reusing a message id in another chat, which puts a different chat's file under
+// the same key. Written back on the key alone, this instance's copy of chat A's file
+// would be filed as chat B's, and the chat guard in front of a later download would let
+// it through: the row it checks is chat B's row, and it is the blob on it that is wrong.
+//
+// The window is the whole media timeout wide. The caller read this row, went off to
+// download a file on its coordinates, and an inbound handler can have replaced it in the
+// meantime. Landing this on the replacement files one message's file under another's, and
+// the chat guard in front of a later download cannot catch it, because the row it checks
+// is the replacement's and it is the blob on it that is wrong.
+//
+// Nothing that describes the message identifies the row it is on. A sender chooses its
+// own message ids, so one id carries two different files in one chat; media that is not
+// encrypted carries neither digest, so the comparison that would tell those two apart
+// compares an empty string with an empty string. What is left is the pair below, and each
+// closes what the other cannot:
+//
+//   - `rev` counts writes to this row. It separates a row from itself after somebody else
+//     has written it, which is the whole of the common case, and it separates it at the
+//     one resolution that matters rather than at the clock's. It changes when the row does
+//     and for no other reason, which is what refreshDirectPath needs of it: that one
+//     rewrites a path without the row becoming another row, so a write-back that follows
+//     it still lands.
+//   - `stored_at` separates a row from a different row that took its place. `rev` cannot:
+//     it starts at nought, so a row the retention sweep dropped and a row an inbound
+//     message wrote in its place are both nought, and a download in flight across that
+//     gap would file its file on a message it knows nothing about. A reincarnation is a
+//     fresh write with a fresh stamp, and it is separated by the whole retention window,
+//     because being older than that window is why the first one was swept.
+//
+// The pair cannot collide. Two stamps agree only inside one millisecond, two revs only
+// when both are fresh inserts, and a row cannot be inserted, swept and inserted again
+// inside one millisecond when what makes it sweepable is being days old.
+//
+// `stored_at` is read and not written, like refreshDirectPath: what changed is which file
+// is on the disk, not when the message was received, and the retention sweep goes by it.
+func (c *Container) rememberBlob(ctx context.Context, sid, blobID string, read *MediaPart) error {
+	const update = `
+		UPDATE wac_media_part SET blob_id = ?
+		WHERE sid = ? AND message_id = ? AND rev = ? AND stored_at = ?`
+	if _, err := c.db.ExecContext(ctx, c.rebind(update),
+		blobID, sid, read.MessageID, read.Rev, read.StoredAt); err != nil {
+		return fmt.Errorf("store: record the file kept for %s: %w", read.MessageID, err)
+	}
+	return nil
+}
+
+func (c *Container) refreshDirectPath(
+	ctx context.Context, sid, messageID, path string, unchangedSince int64,
+) error {
+	const update = `
+		UPDATE wac_media_part SET direct_path = ?
+		WHERE sid = ? AND message_id = ? AND stored_at = ?`
+	if _, err := c.db.ExecContext(ctx, c.rebind(update), path, sid, messageID, unchangedSince); err != nil {
+		return fmt.Errorf("store: refresh where the file of %s is fetched from: %w", messageID, err)
+	}
+	return nil
+}

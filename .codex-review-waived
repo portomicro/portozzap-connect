@@ -1,0 +1,597 @@
+# PR#216: right that a kept name can outlive its truth in one shape this does not cover.
+# If a rename from A to B fails to reach the table, the record holds B beside rows holding
+# A; and if the account then goes back to A without an app-state mutation -- so the only
+# evidence is a message it sent, carrying A -- whatsmeow's `PutPushName` returns
+# `changed=false` and dispatches nothing, so this session never hears it. The rows still
+# hold what they held, the record still says B, and the next process files B over A.
+# What closing it asks for is an observation point that does not exist here: a hook on the
+# push name of every inbound message, which is precisely the name whatsmeow decided not to
+# report because it had not changed. This connector reads names from events, never from
+# message parsing, and adding that path to cover a name returning to exactly the value the
+# rows hold, with no app-state mutation behind it, buys one display field in a case that
+# needs three things at once. The case is named in the PR body as what this does not cover,
+# beside the one it inherited.
+internal/engine/whatsmeow/session.go: Invalidate pending names when the account returns to the held name  # PR#216
+
+# PR#177: the mechanism is right -- a `select` with two ready cases picks between them at
+# random, so waking because the takedown finished says nothing about whether the caller is
+# still there -- and the remedy is wrong for this connector. Refusing a command whose
+# context has expired contradicts a decision this repository already made and tested:
+# `TestADisconnectThatOutlivesItsDeadlineIsStillRecorded` drives a `Disconnect` with an
+# already-cancelled context and requires the teardown to happen anyway, reporting the
+# failure to the caller while the socket closes and the state is published. Two more tests
+# pin the same shape for the error a late command answers with. A lifecycle command that
+# reached the executor runs its effect; what expires is the caller's patience, not the
+# account's state.
+# What the finding names as the harm -- "Disconnect can launch its socket teardown after the
+# caller timed out" -- is therefore the intended behaviour rather than the defect. The real
+# hazard in the neighbourhood is the opposite one, and it is fixed instead: a disconnect made
+# to wait can be refused before it records that the account should stay down, and the
+# takedown it queued behind reconnects the socket, so the operator's disconnect is undone.
+# `Connect` and `Disconnect` now count without waiting, because neither can have a mutating
+# IQ cut off mid-flight, which is the only thing the wait is for.
+internal/engine/whatsmeow/session.go: Recheck cancellation before starting the command  # PR#177
+
+# PR#177: wrong on its premise. `dispatched` is not the handling time: it is the first
+# statement of `handle`, taken before the arm can reach `s.transition.Lock()`, which is what
+# `TestTheConnectionIsDatedFromTheDispatchAndNotTheHandling` fences off the source. And
+# whatsmeow gives each recovery a goroutine of its own (`go cli.dispatchEvent`, keepalive.go)
+# and calls handlers directly, with no queue in between, so that instant is the recovery's.
+# The consequence the finding builds on therefore does not follow. A replacement's socket can
+# only exist after the recovery happened, so its `connectedAt` is the later of the two, and
+# `lastKnownAlive` takes the later -- the superseded recovery loses the comparison it would
+# have had to win. That is what the comment on `answeredKeepAlive` says and why it can be
+# unconditional.
+internal/engine/whatsmeow/session.go: Do not date stale keepalive recoveries as current  # PR#177
+
+# PR#177: right, and right about the size of it too -- the gap is not the handshake, it is
+# the prekey count, the prekey upload and the passive IQ that whatsmeow runs in a goroutine
+# before it dispatches `Connected` (connectionevents.go:164 onwards), up to four IQ round
+# trips at 75s each, while the keepalive loop has been running since the noise handshake.
+# The remedy it names exists: `Client.LastSuccessfulConnect` is exported and is set before
+# that goroutine starts. It is also a plain `time.Time` with no mutex, written in one place
+# and read nowhere in the library, and the read would sit in the `Connected` arm for one
+# connection while the next connection's `handleConnectSuccess` writes it -- on exactly the
+# path this is about, since the arm being slow is the premise. A torn `time.Time` fails in
+# both directions at once: never taking a mute socket down, or resetting a healthy one.
+# Trading a narrow window for a data race on the same path is not an improvement. The
+# residue is issue #181, with the two ways out (an upstream accessor, or a clamped read),
+# and what it costs when it bites is main's behaviour for one socket, not a regression.
+internal/engine/whatsmeow/session.go: Date replacement sockets before the delayed Connected event  # PR#177
+
+# PR#139: right that a self account reported under `hosted`, `hosted.lid` or `c.us` has its
+# verified name filed by whatsmeow under that raw JID, while the read here rebuilds the two
+# canonical ones. What makes it narrow is the write next to it: `updateBusinessName` files
+# the name under the JID it was given and then resolves the other namespace and files it
+# there too, so the canonical row is written unless that resolution also fails.
+# Filing under a non-canonical JID from this side is the part not worth doing. Addresses on
+# this connector's own paths are canonical by rule, and a row under `hosted` would be one
+# nothing else here can look up -- the session would be writing a key only it knows about,
+# to cover a case that needs two failures at once. The account's own push name is filed
+# under the canonical pair for exactly that reason.
+internal/engine/whatsmeow/session.go: Persist verified names under canonical self JIDs  # PR#139
+# PR#136: this is a fix an earlier round of this same review asked for, that a later round
+# of it then reported as a bug -- and the later round is right. `client.Store.PushName` is
+# written by whatsmeow from its app-state goroutine (appstate.go, on a push-name setting
+# mutation) while this would read it from the session executor, which is a data race the
+# race detector will find as soon as the two land together. `BusinessName` sits next to it.
+# The names are real and the device does hold them; what is missing is a way to read them
+# that is not a race. The place for that is the handler that already runs on whatsmeow's
+# own goroutine, copying them into the session the way `PairSuccess` copies the identity --
+# which is issue #138, together with the LID a resumed session never learns for the same
+# reason. Reading them here would trade a missing field for a race.
+internal/engine/whatsmeow/contact.go: Return device metadata when resolving the account itself  # PR#136
+# PR#136: right that the contact table is a proxy and not a record of provenance, and the
+# alternative it names -- a per-account mapping this connector writes itself -- is issue
+# #137's third option, which is a table, a migration and a fill path rather than a guard on
+# one command.
+# What the proxy costs is a false negative: a mapping this account did learn, for somebody
+# it has no contact row for, is answered with the half the caller already had. That is
+# narrow in practice, because a row lands from a push name on almost any inbound message,
+# from an address-book sync, and from the redacted phone whatsmeow files for LID members of
+# a group. The case the finding names, `contact.check`, is one where the caller asked by
+# number and already holds it.
+# The direction of the error is the point. A false negative loses half an answer; a false
+# positive hands one operator's client a number another operator's account was shown, which
+# is what #137 is about and what this command must not add a lookup for.
+internal/engine/whatsmeow/contact.go: Track encounters independently of contact names  # PR#136
+# PR#133: `hosted` is not another person. It is a device domain -- whatsmeow's own
+# ActualAgent maps `s.whatsapp.net`, `lid`, `hosted` and `hosted.lid` to four domains over
+# the same user -- so `5541988887777@hosted` and `5541988887777@s.whatsapp.net` are the
+# same account, and `addressOf` canonicalises them to one phone everywhere in this
+# connector, on purpose. The claim it produces is therefore true, not spoofed.
+# What the finding describes as the exploit needs no `hosted` at all: a member sending
+# `participant: <the author's own number>@s.whatsapp.net` produces exactly the same
+# accepted claim. That is the gap this PR documents as necessary-and-not-sufficient --
+# WhatsApp also requires the sender to be the author or an admin, which costs a metadata
+# round trip per deletion -- and restricting the server closes none of it.
+# Against a gain of nothing sits a real loss: a participant arriving on a server the
+# addressing layer reads as a phone (`c.us`, the legacy spelling, or `hosted`) would have
+# its deletion dropped. The keys that name nobody are already refused, digits included.
+internal/engine/whatsmeow/acted.go: Reject non-user participant domains before canonicalizing  # PR#133
+# PR#3: both still stand, and both are the same answer as the logout below. The
+# connector has no idempotency layer at all yet, for any command; invariant 5 lands with
+# `message.send` in M2 and covers every command at once, so a key on this one command
+# would be a second mechanism to retire. Removing these lines does not decide anything.
+contract/schema/protocol.schema.json: Require an idempotency key for history requests  # PR#3
+contract/fixtures/commands/history_request.json: Require an idempotency key for history requests  # PR#3
+# PR#3: real, and deferred to the engine that has to serve it. `before` is optional and
+# whatsmeow needs an anchor message to build a history sync request, so a native request
+# without one cannot be served. Requiring it in the contract now would also bind the
+# uazapi adapter, which does not need it, and history is M3. The engine refusing an
+# unanchored request with a reason the operator can read is the shape to settle on then.
+contract/schema/protocol.schema.json: Require a usable anchor for native history requests  # PR#3
+# PR#5's "Fence device writes against lease loss" is no longer waived: the fence landed in
+# PR#56. It also turned out not to need any of the three shapes that waiver named — the
+# stores on a device are interfaces, so the fence is a decorator per session and needs
+# neither a container per session nor a session-aware driver.
+internal/store/fence.go: Synchronize dropping with delegated writes  # PR#56 — real, and synchronising does not fix it. A write that passed the fence and is still in the database when Drop runs lands whatever this side does: making Drop wait would delay this instance, and the peer that took the session is already running, so no ordering is bought. What decides which of two writes wins has to be the database, and that is issue #55, where the epoch column and its cost are written down. Waiting would also have to come after the context is cancelled or it deadlocks on the write it is waiting for, which is the same cancel that already bounds it.
+# PR#6's logout deduplication is no longer waived: the idempotency layer it was waiting
+# for landed with `message.send` in PR#9, and `wa:idem:<sid>:<key>` now covers every
+# command that carries an `idempotency_key`. A logout that brings one is deduplicated
+# like any other command.
+internal/engine/whatsmeow/session.go: Reuse an in-flight dial for pairing retries  # PR#6 — real, and a design rather than a guard: joining an existing dial means a shared result every caller can wait on, which is the same machinery M2 needs for idempotent sends. Building a one-off here would be a second one to retire. The retry meanwhile fails with ErrAlreadyConnected and the operator tries again, which is visible rather than silent.
+# PR#6: real, and it needs the machinery M2 brings rather than a guard here. A second
+# session pairing an account displaces the first mapping and deletes its device, but the
+# displaced session's socket keeps working: WhatsApp allows several companion devices, so
+# the new pairing does not unlink the old one, and only the next restart finds it
+# unpaired. Ending it means reaching whichever instance runs it, which is a session-scoped
+# stop over the fleet, the same thing the write fence above needs. Refusing the pairing
+# instead is the other candidate and was not taken in M1: an operator whose old inbox was
+# removed without a logout would have no way left to pair the number at all, and deciding
+# that trade needs the Chatwoot side of the flow, not this package. The premise that made
+# the deletion look safe ("WhatsApp has already unlinked them") was wrong and is corrected
+# in the code comment.
+internal/store/store.go: Reject pairings that displace a live session  # PR#6
+# PR#9: raised three rounds running, and checked on a phone rather than argued about. A
+# quoted reply was sent live with only a stanza id and a participant, and the recipient's
+# client rendered the quote from its own copy of the original. The claim that WhatsApp
+# needs the message embedded in ContextInfo is wrong for the case that matters; where it
+# would bite is a device that does not have the original, and neither the caller nor this
+# connector holds one to embed: Chatwoot's `quoted` is {id, participant, from_me} and no
+# messages are kept here. Carrying content would be a contract change in two repositories
+# for a case a phone says is already working, and refusing quotes would drop the frame off
+# an agent's reply instead.
+internal/engine/whatsmeow/send.go: Populate quoted content before sending replies  # PR#9
+internal/engine/whatsmeow/send.go: Include the original payload in quoted messages  # PR#9
+internal/engine/whatsmeow/send.go: Include the original message in quote context  # PR#9
+# PR#9: real, deliberate, and already named where it is taken. `ClaimSessions` passes a
+# zero min-idle on purpose (`stream.go`, and the comment there says so): the new owner
+# holds the lease, so whoever held those entries has lost it, and waiting the delay would
+# put the abandoned command after the newer one every time, which is the reordering the
+# call exists to prevent. What is left is the heartbeat or so between a lease moving and
+# the old owner noticing. The suggested fix does not close it: a reservation taken before
+# the side effect says an attempt was made, never whether it landed, so an instance that
+# crashes between the two leaves the next one choosing between dropping a message that
+# never went out and sending one that already did — which is why the record is written
+# after the fact and not reserved before it. Two concurrent runners is what invariant 5
+# covers, and for a send the caller's `message_id` is what covers it: the same stanza id
+# twice is discarded by the receiving client. Closing it properly is fencing the engine's
+# writes on the lease, which is the M2 waiver above and needs a session-scoped stop over
+# the fleet rather than a lock here.
+internal/session/session.go: Serialize same-key commands before running them  # PR#9
+# PR#9: real, and the bound that was built for it in this same PR is out again, because
+# both attempts at one were worse than the hole. A pending entry carries no honest age:
+# XPENDING's idle is the time since the last delivery and every XCLAIM resets it, so an
+# entry going round never ages; the stream id is the moment the command was enqueued, not
+# the moment it first ran, so a command that waited a day unread and was only just picked
+# up looks identical to one that has been going round for a day, and retiring on it drops
+# a command that never ran. Knowing when an entry first became pending means writing that
+# down per delivery, which is a key per command on the hot path and a key class the
+# contract does not have. What is in place instead couples the two lifetimes from the
+# other side: Recall pushes the record's expiry out, so a record outlives any entry
+# anybody is still asking about. What is left is a fleet down longer than the TTL with a
+# command still pending, which is a day-long outage; for a send the caller's message_id
+# is what covers the repeat, and the commands where it would bite are the ones the roadmap
+# fences on the lease.
+internal/redisx/idempotency.go: Keep ledger entries through all possible redeliveries  # PR#9
+internal/transport/redisstream/stream.go: Age pending commands from first delivery, not enqueue time  # PR#9
+# PR#15: correct in general and answered the way the finding itself allows, by requiring
+# a context-aware source rather than pretending a wrapper can interrupt a read. Nothing
+# outside a read can end one that has already entered a syscall: a goroutine plus a select
+# returns from Put while the abandoned read goes on writing into a temporary file the
+# caller is about to remove, which trades a stall for a corruption. The requirement is
+# stated on Put, and both callers this has satisfy it — whatsmeow's download hands over
+# bytes already in memory, and an HTTP body from a request carrying the context unblocks
+# when the context does. The check before each read is what covers a source that yields.
+internal/media/store.go: Interrupt the underlying read on cancellation  # PR#15
+# PR#16's "Enforce the blob limit while downloading" is no longer waived: #17 closed, and
+# an inbound file goes through DownloadToFile into the store's own handle rather than
+# through io.ReadAll. The waiver deferred to that issue.
+# PR#16: wrong for this client, and the client says so in its own code. The premise is
+# that a redelivered message is deduplicated and the replacement reference thrown away.
+# Chatwoot's MessageReceived answers a stored message with `duplicate_of(stored)`, which
+# calls `MessageWriter.fetch_media_for(stored, message)` — and `media_in` reads the media
+# off the message that just arrived, not off the stored row, so the fetch is queued with
+# the new owner's ref. There is a spec for it ("queues the download again when a retry
+# finds the message already stored") and a comment naming the case. It stands down only
+# when the bytes are already attached, which is the case where nothing is needed. A blob
+# being instance-local is the contract's own design rather than an oversight: the
+# `connector_blob` kind exists because a file lives on the disk of whoever downloaded it,
+# and the client's MediaRef.PROVIDER_KINDS says the same from the other side.
+internal/engine/whatsmeow/media.go: Keep media references usable across redelivery  # PR#16
+# PR#16's "Retry 404 and 410 media through the phone" is no longer waived: #18 closed in
+# PR#75 and PR#78, and a file WhatsApp dropped is asked of the sender's phone
+# (mediaretry.go, SendMediaRetryReceipt) with the client invited back for it. The waiver
+# deferred to that issue.
+# PR#16's two blob-lifetime titles are no longer waived: #19 closed, and what it asked
+# for exists -- the coordinates of a message's media are kept in wac_media_part and
+# `message.download_media` rebuilds a blob that is gone. Both waivers deferred to that
+# issue, and the second said so in as many words: a blob that has been dropped now costs
+# a round trip instead of the attachment.
+# PR#22: the cost is real and it is the one that was chosen. A download recalled from
+# the ledger is a `connector_blob` URL naming one instance and good until a TTL, and the
+# whole point of the command is that both of those lapse: the recalled answer is an
+# address that fetches nothing, handed back on the path that exists to recover an
+# attachment. Re-running costs at most one file under WAC_MEDIA_MAX_BLOB, against a
+# quota twenty times that, and only on a transport redelivery or a caller's own retry —
+# neither of which is the ordinary path, where MediaFetchJob asks once per message.
+# The two alternatives are both worse here: a blob id derived from the message would put
+# a message id inside a URL the connector serves, and validating a recalled ref before
+# returning it cannot work across instances, which is exactly the case that matters.
+# Registered as #24 rather than only waived, because the cost is worth revisiting once
+# there is a way to validate a ref that another instance issued.
+internal/protocol/types.go: Preserve idempotency for media downloads  # PR#22
+# PR#22's "Fence media writes with the ownership epoch" is no longer waived: #23 closed in
+# PR#56 and PR#93, and Scoped.PutMediaPart asks the fence like every other write from that
+# handle. It took none of the three designs this waiver weighed -- no epoch column, no
+# session-aware driver -- because the stores on a device are interfaces, so the fence is a
+# decorator per session. The comment on the write said the same thing the waiver did and
+# has been corrected with it.
+# PR#33: the mechanism is right and the consequence is not, and the consequence was
+# checked on a phone rather than argued about. whatsmeow does replace the destination of
+# every direct message to a phone JID with the contact's LID (send.go, the
+# DefaultUserServer branch, unconditional and an error if no LID is found), and it leaves
+# the key in the body as it was built -- so the key does name the chat in a different
+# namespace from the stanza carrying it. What does not follow is that the action lands
+# nowhere. Sent live against a real account: an edit, a revoke and a reaction on this
+# account's own messages with the chat addressed by phone all appeared, and then the
+# case this finding is really about -- a reaction on the CONTACT's message, chat addressed
+# by phone, which is the one combination the earlier runs had not covered -- replaced the
+# reaction already on it. The recipient's client resolves the key regardless of which
+# namespace names the chat.
+#
+# Normalising anyway would be changing what goes on the wire on a theory, against
+# evidence, on a path that is working. That is the same trade this PR's own history got
+# wrong twice in the slice before it. What would reopen it: a client that does not
+# resolve it, or WhatsApp tightening the key match -- both of which show up as an action
+# reported successful and not visible, which is what the live phase exists to catch.
+internal/engine/whatsmeow/acting.go: Normalize direct chats before building target keys  # PR#33
+# PR#43: the finding is right about the mechanism and wrong about the remedy, and the
+# remedy would put this path out of step with the one it was copied from. A read mark in
+# a group whose addressing could not be read is sent with the participant as it came, and
+# if the group answers in the other namespace WhatsApp resolves nothing and the ticks do
+# not turn. That is real. What does not follow is that refusing is better: the addressing
+# comes from GetGroupInfo, which is a live IQ with no cache, so a refusal fires on every
+# transient failure of that query -- including the majority of calls where the caller's
+# namespace was already the right one and the mark would have worked. It trades a
+# probable success for a certain failure, and neither outcome loses anything: the ticks
+# not turning is recoverable by marking again, the same way a reaction that lands nowhere
+# is. The reaction path made exactly this call, in the other direction, and wrote the
+# reasoning down in acting_test.go ("refusing over a metadata query having a bad second
+# would break a reaction that mostly works"). Applying strictness to one of the two and
+# not the other would leave them inconsistent with no reason for it. The failed lookup is
+# logged where it happens, which is the visibility this is worth.
+#
+# Where the line actually falls, since the same PR does refuse over a failed query one
+# function down: the account's read-receipt setting. That one fails open -- the read is
+# disclosed to somebody and cannot be taken back -- while this one fails closed, and the
+# worst of it is that nothing happened and the caller marks again. The rule is the
+# direction of the failure, not the query.
+internal/engine/whatsmeow/receipt.go: Fail group read marks when normalization fails  # PR#43
+# PR#45: this is the reverse of what round 6 of the same review asked for, and the
+# invariant it cites does not say what it is read as saying. Invariant 5 is that a
+# redelivered command must not duplicate a side effect. `presence.set` and
+# `presence.subscribe` do not have one to duplicate: the second application leaves
+# WhatsApp in the state the first one did -- available is available, subscribed is
+# subscribed -- so repeating them is not a second effect, it is the same effect asserted
+# again. A send is the shape the invariant is about, and it is in the ledger.
+#
+# What the exclusion buys is the failure that is not recoverable. Availability and every
+# subscription belong to the socket that set them; WhatsApp forgets both when the
+# connection goes and whatsmeow replays neither. A redelivery answered from the ledger
+# reports success over a connection where nothing was done, and nothing after that ever
+# corrects it -- there is no second chance the way a dropped receipt has one. Between an
+# operation applied twice to the same end and one reported as applied and never applied,
+# the second is the one worth avoiding.
+#
+# The remedy proposed instead -- replay the desired presence when a new socket connects --
+# is the better design and a larger one, and it fixes something this does not: presence is
+# lost on any ordinary reconnect, redelivery or no. That is registered as its own issue
+# rather than folded in here, because the subscription set it would have to keep is
+# unbounded by construction and deciding how to bound it is not this slice's decision.
+# Registered as #46.
+#
+# PR#73 built that replay, and both commands stayed excluded: the availability was put
+# back on every connection, but the memory was the session's and the ledger is shared, so
+# a session built by the instance that took the account over had never heard the command
+# and had nothing to put back. Closing that was #72.
+#
+# #72 closed in PR#92, and `presence.set` left the table with it: the availability is now
+# kept where the next owner reads it, and the command fails rather than answering when
+# that record cannot be written, so the ledger's answer is backed by something a later
+# owner will act on. The waiver stands for `presence.subscribe` alone, and for the reason
+# the first paragraph gives -- subscriptions are replayed by nobody, because which parties
+# are worth watching is the client's to know, so what a subscribe sets really does belong
+# to the socket that set it. The asymmetry and both halves of it are spelled out in
+# types.go, above RepeatableCommands.
+internal/protocol/types.go: Preserve idempotency for redelivered presence commands  # PR#45
+# PR#114 r2: right that the surviving title is wider than what it now covers, and the
+# remedy disarms it. A waiver matches on the finding's title normalised and compared for
+# equality (`w["title"] == key` in post-findings.py), so renaming this one to say
+# "subscriptions" stops it matching the finding it exists for, which then blocks the PR
+# every round -- the exact failure the file was written to end. The risk it names is also
+# the wrong way round: `presence.set` left RepeatableCommands because it *is* remembered
+# now, so a future finding under this title asking for idempotency on it would be asking
+# for something the code already does. What the title could still hide is a finding about
+# some third presence command, and there is no third one.
+.codex-review-waived: Narrow the surviving waiver to presence.subscribe  # PR#114 r2
+# PR#45: the claim is true and the remedy is worse than what it fixes. Cancelling a
+# context does not un-send bytes Redis has already buffered, so an XADD can be appended
+# after the moment it carries has expired. Rejecting it server-side means expressing the
+# expiry in Redis's clock, and the connector is not on that machine: it would have to
+# read TIME first and carry an offset, which is another round trip and a race of its own,
+# to put a scripted append on the path of every event for the sake of one class of them.
+#
+# And it would still not be enough, which is the part that decides this. The delay is not
+# only Redis's event loop. A consumer that is behind renders the same stale indicator
+# from a perfectly prompt append, and no rule on the write side bounds the time between
+# an event happening and somebody seeing it. Server-side rejection would close one of the
+# ways to be late and leave the others.
+#
+# So the rule belongs where the whole delay is visible, which is the reader, and the
+# frame already carries what it needs: `ts`. That is now written into the contract's
+# conventions rather than left as an assumption about clients. What the client-side
+# deadline still buys is the other half, and it is why it stays: it stops the pump
+# waiting behind a write nobody wants any more, which is the ordering cost this design is
+# built to avoid.
+internal/session/session.go: Enforce transient expiry inside the Redis append  # PR#45
+# PR#45: the case is real and neither remedy exists at this layer. Tying the generation
+# to the reporting socket needs the event to name the connection it arrived on, and
+# whatsmeow does not say: `events.Presence` carries a JID and nothing else, and
+# `events.ChatPresence` carries a MessageSource, which is about the chat and the sender.
+# Draining the old handlers before activating the replacement is not available either --
+# the handler queue belongs to whatsmeow, the same client is reused across its own
+# automatic reconnect, and this code is a handler rather than the thing driving the loop.
+#
+# What the session can see, it already refuses: a node reported while the connection is
+# down, and a state whose connection went while it waited its turn. What is left is a
+# handler delayed across a whole dial, handshake and authentication, which nothing on
+# this path waits that long for on purpose. One stale event lands: a `composing` that the
+# `paused` or the message after it clears, or an `available` that the next update
+# corrects -- inside the window where a client is resyncing presence anyway, because
+# subscriptions do not survive a reconnect either.
+#
+# Registered as #49, with what upstream would have to expose to close it.
+internal/engine/whatsmeow/session.go: Tie presence to the socket that produced it  # PR#45
+# PR#73: the fact is right and the harm runs the other way. `NoiseSocket.SendFrame` does
+# take its write lock before it reads the context, and a mutex cannot be given a
+# deadline, so a write already stuck behind that lock outlives `presenceWait`. Neither
+# remedy is available: the lock is private to whatsmeow, and forcing the socket closed
+# because a presence node is slow tears a session down over a background nicety, on a
+# suspicion nothing outside the library can confirm.
+#
+# What the finding reads as an amplification is the opposite. The right to the wire does
+# not cause the stall; without it a `presence.set` would block inside SendPresence on the
+# same upstream lock for the same duration and answer nothing at all, which is what every
+# other command that writes a node still does. With it the command fails promptly and the
+# session's executor stays free. The exposure belongs to every node this connector
+# writes, and the fix is upstream.
+#
+# Registered as #74, with the chain that reaches it -- including the telemetry node
+# SendPresence spawns on an unbounded BackgroundEventCtx, and the keepalive blocking on
+# the same lock so it never forces the reconnect that would clear it.
+internal/engine/whatsmeow/presence.go: Make the reconnect timeout cover the upstream write lock  # PR#73
+
+# PR#61's "Backpressure reclaimed commands instead of enlarging the queue" is no longer
+# waived: #62 closed in PR#81, and a refusal now ends a command only while somebody is
+# still there to hear it. The waiver deferred to that issue and has nothing left to defer.
+
+# PR#61's and PR#65's two titles for the fallback-host residue are no longer waived: #63
+# closed in PR#89, and an integrity failure is now retried on a file of its own before
+# the message is called corrupt. Both titles deferred to that issue.
+
+# Poll-with-deadline is the suite's sanctioned idiom (waitFor in app_test.go); what
+# AGENTS.md rules out is sleeping to synchronise, not polling a condition.
+internal/app/dispatch_internal_test.go: Replace wall-clock polling with a completion signal  # PR#65 r5
+
+# PR#65's two config findings are no longer waived: #76 and #79 both closed in PR#82,
+# which moved the manager's own commands onto a goroutine of their own. Each waiver
+# rested on a premise that goroutine removed -- that a wake adopts inside the tick window,
+# and that a detached ack holds the tick up past it -- so neither finding has a lease
+# bound left to argue about. Should either be raised again it is against different code
+# and deserves reading rather than filtering.
+
+# PR#93: right about the residue, wrong that it makes this patch incorrect, and the
+# remedy it names is the one #55 examined and rejected. A check before a write cannot
+# cover the write's own duration, true of any fence that is not the commit itself -- and
+# the commit is where it cannot go: whatsmeow builds its own statements, so a condition
+# cannot be added from outside to the tables holding the expensive writes, and fencing
+# ours alone locks one of two doors. What covers the residue is the renew margin, which
+# exists for exactly this: Owned answers no from `renewedAt + ttl - margin` while the key
+# only expires at `renewedAt + ttl`, so a write admitted at the last possible instant has
+# DefaultRenewMargin to commit in before any peer can take the account. That budget is
+# named and configurable; closing it further is tuning, not a defect. Before this branch
+# the same window was a whole heartbeat wide.
+internal/store/fence.go: Fence writes through the database commit  # PR#93 r1
+
+# PR#118 r2: real, and the remedy does not exist in the pinned library. `SendAppState` is
+# the only exported way in; the `sendAppState` that could tell the two apart is private,
+# and the fetch it does after the patch is accepted (`failed to fetch app state after
+# sending update`) is returned as the call's own error. Splitting the two would mean
+# reading the error's text, which changes without notice and would go quiet exactly when
+# it broke.
+#
+# What it costs is bounded by what the command does. A mark that was applied and reported
+# failed is retried, and the retry sets the same chat to the same state -- unread is
+# unread, and the range is rebuilt from the moment the retry runs rather than replayed
+# from the first attempt, so nothing stale is reapplied. The ledger not recording it is
+# the same shape: what a redelivery repeats is an operation whose second application is
+# indistinguishable from its first.
+internal/engine/whatsmeow/unread.go: Separate patch acceptance from the follow-up resync  # PR#118 r2
+
+# PR#122: half taken, half not. The reading is right -- the Chatwoot controllers update
+# their own roster after the call and only a raised error stops them, so a participant
+# WhatsApp refused would show as promoted -- and the connector now fails the whole command
+# when *nothing* was carried out, which is the shape three of the four actions arrive in
+# and restores what the Baileys generation did by raising. What is not taken is the
+# remedy: holding the command back until the client changes. The contract already names
+# this result shape, the refusal is per participant on WhatsApp's side, and failing a
+# partly-successful request whole would report the participants that *were* added as not
+# added, with no second source for a caller to check against. The rest belongs on the
+# client, and is filed as fazer-ai/chatwoot#483.
+internal/engine/whatsmeow/participants.go: Make callers handle failed participant rows  # PR#122
+# PR#119: the mechanism is real and the consequence is not. A group that migrates from
+# phone numbers to LIDs while the socket stays up is not noticed until the next
+# reconnection, because nothing in whatsmeow emits an addressing-mode change --
+# `AddressingMode` is on `types.GroupInfo` and on no event type, and whatsmeow's own
+# `updateGroupParticipantCache` carries a TODO asking the same question.
+#
+# What that costs is naming a member by phone in a group already on LIDs, which is the
+# case `TestLiveGroupKeyNamespace` measured against real accounts and found harmless: the
+# key names the right member in the other spelling and the receiving client resolves
+# either, and every group event publishes `phone` and `lid` together, measured
+# independently in #120. The direction the translation exists for a stale entry cannot
+# produce, since it would need a migration from LIDs back to phone numbers.
+#
+# The finding also has the member list going stale with it, and that half does not hold
+# while connected: `parseGroupNotification` calls `updateGroupParticipantCache` on every
+# group-change notification (group.go:1047), so joins and leaves keep `Members` fresh. The
+# stale-membership window is the offline one, which `setConnected` already closes.
+#
+# The only fix available is a TTL, there being no event to listen for, and it would pay a
+# metadata round trip per group per window to bound a staleness whose only measured effect
+# is harmless. Reasoning, cost and correction path in #125.
+internal/engine/whatsmeow/acting.go: Refresh both caches when a group migrates  # PR#119
+# PR#124: not taken, and the reasoning is that the premise inverts. The rule it cites
+# protects clients that already receive a frame; it cannot protect a client of a command no
+# connector has ever answered. `group.join_requests.list` was refused with `unsupported`
+# until this PR, so nothing has ever decoded a `requested_at` from a native connector and
+# nothing can reject one now -- and the only client there is already treats the date as
+# optional (`join_request_payload` builds the hash with `.compact`). Read the way the
+# finding reads it, *any* implementation of this command would be a breaking change,
+# because v1 promised a shape no build ever produced; a rule that forbids implementing the
+# contract is not the rule. What the finding is right about is that the contract and the
+# build must agree, and they do: `contract/README.md` says `timestamp_ms|null` in this same
+# PR, which is the same "present and null" the rest of the contract already uses for
+# `address`, `url` and `code`. The alternative it proposes -- an integer always -- means
+# inventing a date when there is none, and year 1 renders as a real date and sorts as one.
+internal/engine/whatsmeow/joinrequests.go: Keep nullable timestamps out of protocol v1  # PR#124
+# PR#124: real, and the answer is the one PR#122 already gave for the same shape. The
+# client does ignore the rows and `remove_handled_requests` drops every JID it asked about,
+# so a refused request disappears from the pending list -- filed as fazer-ai/chatwoot#483,
+# which this PR extends to name `handle_group_join_requests` alongside the participants
+# controller. What this connector will not do is fail a request that partly succeeded. The
+# dashboard approves in batches, so failing whole would leave the people WhatsApp *did* let
+# in sitting in the pending list, and the mirror image of the reported bug is not a fix for
+# it: one leaves the dashboard wrong about somebody who is in the group, the other about
+# somebody who is not. Both are corrected by the next listing, and neither is worth
+# answering `ok:false` for a request that was carried out. It also has to match
+# `group.participants.update`: the two answer the same rows, and a client written against
+# one and surprised by the other is a worse contract than either rule alone. Nothing is
+# carried out at all still fails, which is the case the dashboard actually sends.
+internal/engine/whatsmeow/joinrequests.go: Handle partial join-request refusals before returning success  # PR#124
+# PR#139: the invariant this asks for is the one the code already holds, and the one it
+# names is not recoverable here. Every write to the table happens inside `naming` and
+# re-reads the session's current name first, so a row is only ever written with the name
+# the session was holding at that moment, and the marker is only cleared by the writer of
+# a name that is still current. Walk the interleavings of two renames A and B and the two
+# copies agree at the end of all of them: whichever handler assigns last is the one whose
+# check passes, and the other returns without writing. What is left over is which of two
+# simultaneous renames is the newer, and that is not decidable from here -- whatsmeow
+# dispatches these from two paths with no shared clock, `events.PushName` carries no
+# timestamp of its own, and the app-state sync that carries the authoritative value is
+# redelivered anyway. Holding the session lock across the store write instead would order
+# them, at the price of stalling every other reader of the session for as long as the
+# database takes, to decide a race between two names the account set seconds apart.
+internal/engine/whatsmeow/session.go: Order concurrent renames before replacing the session name  # PR#139
+# PR#144: `waitFor` polls with a 5ms sleep and a 5s deadline, and that is not the pattern
+# the rule names. What it forbids is a sleep standing in for synchronisation -- sleep 100ms,
+# then assert -- which passes when the scheduler is kind and fails when it is not. This
+# waits for a condition and fails loudly if it never holds, so its outcome does not depend
+# on how long anything took; the sleep is only how often it looks. Where a signal exists,
+# the tests in this PR take it: `hop.swallowed` for a round trip in flight, `entered` and
+# `let` for a publish held mid-write, `handed` for a hand-back that finished. What is left
+# is a flag another goroutine sets after a callback has already returned -- `Retired`, set
+# by the pump after `publish` settles -- and there is nothing to wait on for those without
+# putting a channel in production code for the tests to read. The same shape is used
+# throughout the repository's own suites (internal/app, transport/redisstream).
+internal/session/manager_internal_test.go: Replace polling sleeps with deterministic synchronization  # PR#144
+# PR#149: a two-release rollout is what you need when new behaviour breaks old
+# participants, and nothing here does. Every pairing during a rolling deploy is either
+# fixed or exactly main's behaviour today: new reader with new writer is the fix; new
+# reader with old writer finds no mark and acknowledges the wake, which is what main
+# does; old reader ignores the mark and acknowledges the wake, which is also what main
+# does. At no point is any instance worse off than before the change, so there is no
+# window to stage. The mark is a key nothing else reads, with a TTL of one lease, and
+# an old instance that wins a lease without clearing a mark is covered by the fence:
+# readers compare mark against holder, and a mark naming somebody who no longer holds
+# the lease reads as nobody handing anything back. The one case an old binary leaves
+# behind -- winning a lease under an instance id a mark still names -- costs wakes left
+# pending for at most one TTL, with nothing lost. Staging it over two releases would
+# add a flag and a second deploy to buy a property the additive shape already has.
+internal/cluster/lease.go: Stage the hand-back marker for mixed-version fleets  # PR#149
+# PR#149: the group this is about is the one that only exists when every lease on the
+# instance is already past its usable life, and there is no ordering that closes it.
+# Leases are renewed in one pipelined batch under one reading of the clock, so an
+# instance's leases age together; a session adopted between ticks is stamped when it is
+# acquired, which makes it newer and never older; and one whose renewal fails on its own
+# is stopped by the sweep. Measured from outside on a running fleet, reading every PTTL in
+# one EVAL rather than one call per key: across forty samples of thirty-three leases and
+# forty of twenty-seven, the spread between the newest and the oldest was 0 ms in thirty of
+# them and 1 ms in the rest, never more, with the smallest TTL seen 25.0 s of 30.
+# So `ending` is empty, which is every ordinary shutdown, or it is everything, which is an
+# instance that stopped renewing for about a whole TTL: a frozen process, a long pause, a
+# suspended machine.
+#
+# In that state the exposure this names is one margin long. Local freshness at zero means
+# the key in Redis has at most the margin left before it expires on its own, and after
+# that a wake adopts the account normally; the loss needs a wake inside that window. What
+# closing it would cost is a round trip in front of every socket, which is the finding two
+# rounds ago -- and an instance that has not reached Redis for a whole TTL is not one
+# whose mark would land anyway. Marking before the stops and stopping before the marks
+# cannot both be true, and this side is the one where the residue is bounded by the margin
+# rather than by how long a Redis outage lasts.
+internal/session/manager.go: Mark each expiring hand-back before another stop can block  # PR#149
+# PR#149: this one needs both groups to exist at once, and the two things it needs pull
+# against each other. A lease only reaches the group with no room by going about a whole
+# TTL without a renewal, which means the instance was not reaching Redis or was not
+# running at all; a lease is only in the other group if it was renewed or acquired
+# recently, which means it was. For the harm named here the releases in front also have to
+# block, so Redis has to be away again by then. Measured on a running fleet, reading every
+# PTTL in one EVAL rather than one call per key, an instance's leases carry the same
+# expiry to the millisecond: across forty samples of thirty-three leases and forty of
+# twenty-seven, the spread was 0 ms in thirty of them and 1 ms in the rest, never more.
+# They are renewed in one pipelined batch under one reading of the clock; a session
+# adopted between ticks is stamped when it is acquired, so it is newer than the rest and
+# never older, and one whose renewal fails on its own is stopped by the sweep rather than
+# kept.
+#
+# What is left is a sequence -- frozen for a TTL, resumed, an account adopted, Redis away
+# again, SIGTERM -- against a fix that would put the releases behind every socket, which
+# is the finding four rounds ago, or bound them so tightly they stop landing, which is
+# what the mark exists to avoid. Marking before the stops and stopping before the marks
+# cannot both be true; this is the ninth round on that one trade, and the residue on this
+# side is one margin of lease rather than the length of an outage.
+internal/session/manager.go: Stop fresh sockets before blocking on stale releases  # PR#149
+internal/engine/whatsmeow/call.go: Keep call publication from blocking subsequent rejections  # PR#220 -> #221
+# PR#314: a wake is not a way to reach the instance that owns a session, and the contract now says so
+# (PROTOCOL.md, session.wake): the fleet hands it to whichever instance reads it first, and a peer that
+# does not own the account acknowledges it. A wake forfeited because the owner's queue was full can
+# therefore be acknowledged by a peer. The owned session's retry path is `session.connect` on its own
+# stream, which reaches the owner; a queue of 128 commands is a client actively driving the session.
+internal/session/manager.go: Preserve the connect retry when another instance claims the wake  # PR#314
+internal/session/manager.go: Deliver wake retries to the existing owner  # PR#314
+internal/engine/whatsmeow/wireonce.go: Distinguish pre-send cancellation from an unanswered write  # PR#371
+third_party/meowcaller/engine_media.go: Refresh allocations using the current call mode  # PR#387, group calls out of #380
+third_party/meowcaller/engine.go: Drain deferred video controls before allowing live updates  # PR#387, video out of #380
+third_party/meowcaller/engine.go: Preserve orientation set before the video sender exists  # PR#387, video out of #380
+
+# PR#393: measured, and it does not happen on this pin. pion matches the codec an answer
+# names against the MediaEngine's table without case and hands the track the table's own
+# spelling, so `codecFor` sees `audio/G722` and `audio/PCMU` however the browser wrote them.
+# `TestACodecNamedInLowerCaseIsStillTheCodec` answers in `g722/8000` and `pcmu/8000` and
+# passes with the case-sensitive switch (and failed to tell the difference when the
+# case-insensitive match was added, which is why it was taken back as dead code). The test
+# stays as the pin: a pion bump that stopped normalizing would fail it.
+internal/calls/codec.go: Match codec MIME types case-insensitively  # PR#393

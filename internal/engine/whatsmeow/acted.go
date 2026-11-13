@@ -1,0 +1,799 @@
+package whatsmeow
+
+import (
+	"context"
+	"errors"
+	"strings"
+
+	wm "go.mau.fi/whatsmeow"
+
+	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
+	waTypes "go.mau.fi/whatsmeow/types"
+	waEvents "go.mau.fi/whatsmeow/types/events"
+
+	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+)
+
+// What arrives when somebody acts on a message that already exists.
+//
+// WhatsApp has no verb for any of this. An edit, a deletion and a reaction all travel as
+// ordinary messages whose body says what they do to another one, which is why they land
+// in the same handler a new message does and why telling them apart is the whole job
+// here. Read as new messages they are worse than useless: an edit publishes the
+// correction as a second bubble or is deduplicated away, a deletion has no body to
+// render at all, and a reaction turns into a message the account never received.
+//
+// Each of the three is its own event on the wire because the client does something
+// different with each: rewrite a bubble, flag or blank one, annotate one. The contract
+// already names all three and this is the side that had yet to produce them.
+
+// verdict is what a stanza that changes a message is worth doing about.
+type verdict int
+
+const (
+	// notAChange is an ordinary message, and the caller carries on with it.
+	notAChange verdict = iota
+	// publishChange is one this build renders, and the payload is ready to go out.
+	publishChange
+	// dropChange is one nothing will ever publish -- no later milestone, no better
+	// build. Acknowledged rather than refused, because withholding would leave WhatsApp
+	// redelivering it for as long as the session is up.
+	dropChange
+	// withholdChange is one this session cannot publish yet and the same stanza
+	// redelivered could: the keys to open it were out of reach for a moment. Nothing that
+	// only a later build could publish is kept this way, because WhatsApp does not wait
+	// for one -- fifty minutes after delivering a message nobody acknowledged it closes
+	// the stream with an `ack` error naming it, and every redelivery starts that clock
+	// again (#402).
+	withholdChange
+)
+
+// change is what changeOf decided, with what to publish or what to say about not
+// publishing it.
+type change struct {
+	verdict verdict
+	kind    protocol.EventType
+	payload any
+	// why is the line the log carries for a drop or a withhold. It never names a body,
+	// an emoji or a phone number: this is the log of the fact that something happened,
+	// not of what was said.
+	why string
+	// err is what went wrong where something did. zerolog drops a nil one, so every
+	// verdict logs the same way whether or not there was an error behind it.
+	err error
+}
+
+// because attaches what went wrong to a drop or a withhold.
+func (c change) because(err error) change {
+	c.err = err
+	return c
+}
+
+func publishing(kind protocol.EventType, payload any) change {
+	return change{verdict: publishChange, kind: kind, payload: payload}
+}
+
+func dropping(why string) change { return change{verdict: dropChange, why: why} }
+
+func withholding(why string) change { return change{verdict: withholdChange, why: why} }
+
+// changed is changeOf plus the one arm that cannot be decided by reading the stanza.
+//
+// A correction arrives sealed under the secret of the message it corrects, and opening
+// it takes the device store the socket writes rather than anything on the wire. That is
+// not an exotic shape: a phone editing a message in a plain one-to-one chat sends this,
+// and the wrapped protocol message the library also knows how to build is what arrives
+// through other doors. Measured against a real phone, not read off a specification.
+func (s *Session) changed(event *waEvents.Message) change {
+	sealed := event.Message.GetSecretEncryptedMessage()
+	// Comparing the type is safe on a nil message because MESSAGE_EDIT is not the zero
+	// value of that enum -- UNKNOWN is. The other things sealed this way are a poll
+	// edit, an event edit and a schedule, and the contract carries none of them.
+	if sealed.GetSecretEncType() == waE2E.SecretEncryptedMessage_MESSAGE_EDIT {
+		return s.unsealedCorrection(event, sealed)
+	}
+	if reaction := event.Message.GetEncReactionMessage(); reaction != nil {
+		return s.unsealedReaction(event, reaction)
+	}
+	return s.changeOf(event)
+}
+
+// unsealedCorrection opens a sealed correction and renders it, or says why it could not.
+//
+// The two ways it fails are not the same answer, and getting that backwards is the
+// mistake this milestone has already made twice in both directions. A secret this
+// session never had is final: it was stored when the message being corrected arrived,
+// and a redelivery brings the same ciphertext and no key -- so it is acknowledged and
+// the correction is lost, rather than kept and redelivered for as long as the session is
+// up. A socket that is not up yet, or a store that ran out of time, is not final, and
+// that one is kept.
+//
+// Anything else -- a payload that will not decrypt, a store that answered with an error
+// of its own -- is treated as final. It costs one correction, loudly, against a
+// redelivery loop that costs every one after it too.
+func (s *Session) unsealedCorrection(event *waEvents.Message, sealed *waE2E.SecretEncryptedMessage) change {
+	target := sealed.GetTargetMessageKey().GetID()
+	if target == "" {
+		return dropping("dropping a sealed correction that names no message to correct")
+	}
+	chat, sender, addressed := s.whereAndWho(event)
+	if !addressed {
+		return dropping("dropping a sealed correction this build cannot address")
+	}
+
+	open := s.unseal
+	if open == nil {
+		open = s.unsealOverStore
+	}
+	// Bounded, because this runs on whatsmeow's own node handler: a store that never
+	// answers would hold the socket's next node behind it with nothing to release it.
+	ctx, cancel := context.WithTimeout(s.ctx, s.storeLimit)
+	defer cancel()
+
+	plain, err := open(ctx, event)
+	switch {
+	case errors.Is(err, wm.ErrNotLoggedIn), errors.Is(err, wm.ErrClientIsNil),
+		errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		return withholding("withholding an acknowledgement for a correction this session could not reach its keys for").because(err)
+	case err != nil:
+		return dropping("dropping a correction this session has no key for").because(err)
+	}
+
+	corrected, at := theSealedBody(plain, event)
+	return publishing(protocol.EventMessageEdited, protocol.MessageEdited{
+		Chat:      chat,
+		Sender:    sender,
+		MessageID: target,
+		FromMe:    event.Info.IsFromMe,
+		Content:   correctedContent(corrected),
+		Timestamp: at,
+	})
+}
+
+// unsealOverStore is what opens a sealed change when nothing has replaced it: the
+// socket's own device store, where the secret of every message this session has seen was
+// put as it arrived.
+func (s *Session) unsealOverStore(ctx context.Context, event *waEvents.Message) (*waE2E.Message, error) {
+	return s.current().DecryptSecretEncryptedMessage(ctx, event)
+}
+
+// theSealedBody is what a sealed correction says the message now reads, and when.
+//
+// What a phone really sends is the wrapper: measured against one, the plaintext of a
+// correction made in a direct chat is the protocol message an unsealed correction
+// carries, and the clock inside it is what makes the published timestamp land on a
+// millisecond rather than on the stanza's second. That is the branch that fires.
+//
+// The other is the fallback for a plaintext that is the new body on its own, which is
+// what the field the payload is unmarshalled into allows and what nothing has been seen
+// to send. It is here because the alternative to rendering it is refusing it, and the
+// envelope carries no clock of its own to stamp it with.
+func theSealedBody(plain *waE2E.Message, event *waEvents.Message) (corrected *waE2E.Message, at int64) {
+	if inner := plain.GetProtocolMessage(); inner.GetType() == waE2E.ProtocolMessage_MESSAGE_EDIT {
+		return inner.GetEditedMessage(), stampedAt(inner.GetTimestampMS(), event)
+	}
+	return plain, event.Info.Timestamp.UnixMilli()
+}
+
+// changeOf reads a stanza as something done to a message that already exists, and says
+// so when it is not one.
+//
+// The order is what makes it readable: a reaction is recognised by what it carries, and
+// everything else by the `edit` attribute WhatsApp puts on the stanza. The attribute is
+// checked exhaustively rather than by exclusion, so an attribute a future WhatsApp
+// introduces is refused with a name rather than published as whatever it happens to
+// resemble.
+func (s *Session) changeOf(event *waEvents.Message) change {
+	switch {
+	case event.Message.GetReactionMessage() != nil:
+		return s.reactionOf(event, event.Message.GetReactionMessage())
+
+	case event.IsEdit,
+		event.Info.Edit == waTypes.EditAttributeMessageEdit,
+		event.Info.Edit == waTypes.EditAttributeAdminEdit,
+		newsletterEdit(event),
+		resentEdit(event):
+		return s.editOf(event)
+
+	case revokes(event):
+		return s.revokeOf(event)
+
+	case event.Info.Edit == waTypes.EditAttributePinInChat:
+		// Pinning is not a change to the message, it is a change to where the chat shows
+		// it, and the contract has no event for it in any milestone. Acknowledged, or
+		// every pin in every chat would redeliver for good.
+		return dropping("dropping a pin, which the contract does not carry")
+
+	case marksAMessage(event.Message):
+		// Something done to a message that already exists, in a way the contract has no
+		// event for. The three it does have were taken above; what is left is a poll's
+		// own machinery and the two ways WhatsApp marks a message rather than replacing
+		// it. None of them is a bubble on the sender's phone either, which is the test --
+		// a vote published as a message received is one bubble per voter for something
+		// the voter never sent.
+		return dropping("dropping something that marks a message rather than adding one")
+
+	case bodyless(event.Message) && keyMaterial(event.Message):
+		// A group handing out what makes its messages readable. It rides along with the
+		// message it was sent for as often as it arrives alone, and then that message is
+		// what gets rendered; alone, whatsmeow files it and nothing is left to read. The
+		// placeholder the message path would otherwise give it is a bubble in an agent's
+		// thread every time a group's membership changes.
+		return dropping("dropping key material, which is how a conversation stays readable rather than something somebody sent")
+
+	case housekeeping(event.Message.GetProtocolMessage()):
+		// The account's own plumbing: a history sync notification, an app state key
+		// share, the answer to a peer request. whatsmeow acts on these itself and none
+		// carries anything a conversation shows, so the placeholder the message path
+		// would otherwise give them is a bubble in an agent's thread once per sync.
+		return dropping("dropping a protocol message that is the account's own plumbing")
+
+	case unseen(event.Message.GetProtocolMessage()):
+		// Somebody's client talking to this one, and nothing the phone shows: a placeholder
+		// for it is a bubble the agent cannot answer and the contact never saw.
+		return dropping("dropping a protocol message the phone shows nothing for")
+
+	case event.Info.Edit != waTypes.EditAttributeEmpty:
+		// WhatsApp added something. Logged and acknowledged rather than guessed at from
+		// the body, which would file it as whichever of the three it happens to look like.
+		return dropping("dropping a way of changing a message this build does not know")
+	}
+	return change{verdict: notAChange}
+}
+
+// marksAMessage reports whether a stanza changes a message that already exists rather
+// than adding one, in a way the contract has no event for.
+//
+// Both lists here and the one below were read off the message descriptor rather than
+// grown one report at a time: three review rounds in a row found another arm that
+// belonged on one of them, which is what a list assembled from whatever turned up looks
+// like. What is on them is what a sweep of the descriptor found; what is not is a
+// message, and gets the placeholder.
+//
+// The candidates were found mechanically rather than argued over: every arm carrying a
+// WACommon.MessageKey names a message that already exists, and there are twenty-two of
+// them. Naming one is necessary and is not sufficient, which is the line -- a quote names
+// the message it answers and is still a message, a payment names the request it settles
+// and is still a payment. What is here is what says nothing of its own: a vote, an added
+// option, an RSVP, a call being rescheduled, a request being declined or cancelled, a
+// message being kept or pinned.
+//
+// A poll's result snapshot is deliberately not here, and reading the descriptor is what
+// settled it: unlike a vote and an added option it names no poll at all, so it is
+// WhatsApp posting a tally as its own bubble.
+//
+// The sticker resync is the odd one out and carries no key: it marks nothing and it is
+// not key material either, it is a list of file hashes and a timestamp asking for a pack
+// to be sent again. It has nowhere better to be than the list of what is not a message.
+//
+// A key is how most of them name what they mark, and not the only way, which is what the
+// key sweep alone could not see: a split payment update names its split by id and the
+// person by JID, and those two fields are the whole arm. So the sweep that settles this
+// list is over the arms carrying no field that could hold anything a person said -- and
+// running it over the descriptor turns up eleven, seven of them already here or in
+// keyMaterial. Of the four left, three are their own bubble rather than a mark on
+// somebody else's: a payment invite is an invitation, a placeholder is WhatsApp saying a
+// message exists that this device may not read, and a status link preview's style
+// travels with the status it decorates. The fourth is the split payment update.
+func marksAMessage(message *waE2E.Message) bool {
+	return message.GetPollUpdateMessage() != nil ||
+		message.GetPollAddOptionMessage() != nil ||
+		// The whole arm, not a list of its types. It carries a targetMessageKey by
+		// construction, so every one of them changes a message that already exists: a
+		// poll edited, an option added, an event edited, a message scheduled. The one
+		// the contract has an event for -- a correction -- was opened before this ran.
+		message.GetSecretEncryptedMessage() != nil ||
+		message.GetEncEventResponseMessage() != nil ||
+		message.GetKeepInChatMessage() != nil ||
+		message.GetPinInChatMessage() != nil ||
+		message.GetScheduledCallEditMessage() != nil ||
+		message.GetDeclinePaymentRequestMessage() != nil ||
+		message.GetCancelPaymentRequestMessage() != nil ||
+		message.GetStickerSyncRmrMessage() != nil ||
+		message.GetSplitPaymentUpdateMessage() != nil ||
+		movedAgain(message.GetLiveLocationMessage())
+}
+
+// movedAgain reports whether a live location is a further position rather than the start
+// of the share.
+//
+// Read off the sequence number, which is the field the protocol has for exactly this and
+// the reason it is right whichever arm carries the announcement: if the share starts as a
+// LocationMessage with `isLive`, every one of these is a position and every one has a
+// sequence; if it starts as a LiveLocationMessage, that one is the first and carries
+// none. Either way what publishes is the start and what drops is the stream -- which
+// otherwise arrives as a bubble every few seconds for as long as somebody is walking.
+func movedAgain(moving *waE2E.LiveLocationMessage) bool {
+	return moving != nil && moving.GetSequenceNumber() > 0
+}
+
+// keyMaterial reports whether a stanza carries what keeps a conversation readable: the
+// sender key a group hands out, and the three other shapes WhatsApp distributes keys in.
+// whatsmeow files each of them and dispatches the event anyway.
+func keyMaterial(message *waE2E.Message) bool {
+	return message.GetSenderKeyDistributionMessage() != nil ||
+		message.GetFastRatchetKeySenderKeyDistributionMessage() != nil ||
+		message.GetGroupRootKeyShare() != nil ||
+		message.GetRootSecretDistributeMessage() != nil
+}
+
+// unseen reports whether a protocol message is one a person's client sends and the phone
+// shows nothing for.
+//
+// Not plumbing, which is why it is not on housekeeping's list: these come from the
+// contact's side, or from Meta AI. A phone number shared with a business, the request for
+// its welcome message when a chat is opened, feedback on and the machinery of Meta AI, a
+// scheduled message being called off. None is a bubble on either phone, and mautrix-whatsapp,
+// which renders every protocol message it can, renders none of them.
+//
+// What stays out is what the phone does show, as a line of its own in the chat: a
+// disappearing timer, a reminder, a theme, advanced chat privacy, a member's label. Those
+// keep the `protocol` placeholder, and so does every type nobody has looked at yet.
+func unseen(message *waE2E.ProtocolMessage) bool {
+	if message == nil {
+		return false
+	}
+	switch message.GetType() {
+	case waE2E.ProtocolMessage_SHARE_PHONE_NUMBER,
+		waE2E.ProtocolMessage_REQUEST_WELCOME_MESSAGE,
+		waE2E.ProtocolMessage_BOT_FEEDBACK_MESSAGE,
+		waE2E.ProtocolMessage_BOT_MEMU_ONBOARDING_MESSAGE,
+		waE2E.ProtocolMessage_STOP_GENERATION_MESSAGE,
+		waE2E.ProtocolMessage_AI_PSI_METADATA,
+		waE2E.ProtocolMessage_AI_QUERY_FANOUT,
+		waE2E.ProtocolMessage_AI_MEDIA_COLLECTION_MESSAGE,
+		waE2E.ProtocolMessage_MESSAGE_UNSCHEDULE,
+		waE2E.ProtocolMessage_AI_METADATA_OPERATION:
+		return true
+	default:
+		return false
+	}
+}
+
+// housekeeping reports whether a protocol message is the account's own plumbing rather
+// than something a person did.
+//
+// It is a list of what to drop and not a list of what to keep, and that direction is the
+// whole design. WhatsApp adds types to this enum -- it is past thirty and still growing
+// -- and the two ways of being wrong about a new one are not the same size: read as
+// plumbing it is acknowledged and gone, and read as something a person did it is a
+// bubble an agent can see and ask about. So an unknown type falls through to the
+// placeholder, and only what has been looked at and found to be plumbing is dropped.
+//
+// What is deliberately not here is what a person's client sends: unseen takes what the
+// phone shows nothing for, and the rest -- a disappearing timer, a reminder, a chat theme,
+// a label change -- is somebody acting in the conversation, which the contract's
+// `protocol` reason says exactly.
+func housekeeping(message *waE2E.ProtocolMessage) bool {
+	if message == nil {
+		return false
+	}
+	switch message.GetType() {
+	case waE2E.ProtocolMessage_EPHEMERAL_SYNC_RESPONSE,
+		waE2E.ProtocolMessage_HISTORY_SYNC_NOTIFICATION,
+		waE2E.ProtocolMessage_APP_STATE_SYNC_KEY_SHARE,
+		waE2E.ProtocolMessage_APP_STATE_SYNC_KEY_REQUEST,
+		waE2E.ProtocolMessage_MSG_FANOUT_BACKFILL_REQUEST,
+		waE2E.ProtocolMessage_INITIAL_SECURITY_NOTIFICATION_SETTING_SYNC,
+		waE2E.ProtocolMessage_APP_STATE_FATAL_EXCEPTION_NOTIFICATION,
+		waE2E.ProtocolMessage_PEER_DATA_OPERATION_REQUEST_MESSAGE,
+		waE2E.ProtocolMessage_PEER_DATA_OPERATION_REQUEST_RESPONSE_MESSAGE,
+		waE2E.ProtocolMessage_MEDIA_NOTIFY_MESSAGE,
+		waE2E.ProtocolMessage_CLOUD_API_THREAD_CONTROL_NOTIFICATION,
+		waE2E.ProtocolMessage_LID_MIGRATION_MAPPING_SYNC,
+		waE2E.ProtocolMessage_COEX_STATE_SYNC:
+		return true
+	default:
+		return false
+	}
+}
+
+// revokes reports whether this stanza deletes a message rather than carrying one.
+//
+// The protobuf half is read only once there is a protocol message to read it from.
+// REVOKE is the zero value of that enum, so GetType() on the nil an ordinary text
+// message carries answers REVOKE, and reading it without the guard would classify every
+// message in the account as a deletion of itself.
+func revokes(event *waEvents.Message) bool {
+	switch event.Info.Edit {
+	case waTypes.EditAttributeSenderRevoke, waTypes.EditAttributeAdminRevoke:
+		return true
+	}
+	deletion := event.Message.GetProtocolMessage()
+	return deletion != nil && deletion.GetType() == waE2E.ProtocolMessage_REVOKE
+}
+
+// reactionOf renders `message.reaction`, which is also how a reaction is taken back: an
+// empty emoji is the removal, and it is the one field here that is never omitted.
+// unsealedReaction opens a reaction a community announcement group sealed under the
+// secret of the message it is on, and renders it.
+//
+// Withheld until this build could read one, which was a redelivery loop: WhatsApp sends
+// an unacknowledged stanza again for as long as the session is up, so an account in a
+// community whose announcement group it follows paid a warn line per reaction, forever.
+// Everything about the split below is the sealed correction's, for the same reasons.
+//
+// The key is the part that is easy to get wrong and silent when you do. EncryptReaction
+// takes the key off the reaction before sealing it and puts it on the envelope, so what
+// comes back out of the decryption names no message at all. Handed to reactionOf as-is
+// it is dropped for naming no target -- with the emoji decrypted and in hand, and
+// nothing in the log saying the reaction was ever readable.
+func (s *Session) unsealedReaction(event *waEvents.Message, sealed *waE2E.EncReactionMessage) change {
+	open := s.unsealReaction
+	if open == nil {
+		open = s.unsealReactionOverStore
+	}
+	// Bounded, because this runs on whatsmeow's own node handler: a store that never
+	// answers would hold the socket's next node behind it with nothing to release it.
+	ctx, cancel := context.WithTimeout(s.ctx, s.storeLimit)
+	defer cancel()
+
+	reaction, err := open(ctx, event)
+	switch {
+	case errors.Is(err, wm.ErrNotLoggedIn), errors.Is(err, wm.ErrClientIsNil),
+		errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		// Not final. The socket is not up yet, or the store ran out of time, and the
+		// same stanza redelivered to a session that is ready opens.
+		return withholding("withholding an acknowledgement for a reaction this session could not reach its keys for").because(err)
+	case err != nil:
+		// Final. The secret was stored when the message being reacted to arrived, and a
+		// session that never saw that message is not handed it by a redelivery: keeping
+		// this would buy the loop back for the one case that can never resolve.
+		return dropping("dropping a reaction this session has no key for").because(err)
+	}
+
+	reaction.Key = sealed.GetTargetMessageKey()
+	return s.reactionOf(event, reaction)
+}
+
+// unsealReactionOverStore is what opens a sealed reaction when nothing has replaced it.
+func (s *Session) unsealReactionOverStore(
+	ctx context.Context, event *waEvents.Message,
+) (*waE2E.ReactionMessage, error) {
+	return s.current().DecryptReaction(ctx, event)
+}
+
+func (s *Session) reactionOf(event *waEvents.Message, reaction *waE2E.ReactionMessage) change {
+	target := reaction.GetKey().GetID()
+	switch {
+	case target == "":
+		return dropping("dropping a reaction that names no message to put it on")
+	case event.Info.ID == "":
+		// The client deduplicates on it and matches its own sends by it. Nothing arrives
+		// later that supplies one, so a redelivery would be the same stanza again.
+		return dropping("dropping a reaction with no id of its own")
+	}
+	chat, sender, addressed := s.whereAndWho(event)
+	if !addressed {
+		return dropping("dropping a reaction this build cannot address")
+	}
+	return publishing(protocol.EventMessageReaction, protocol.MessageReaction{
+		ID:        event.Info.ID,
+		Chat:      chat,
+		Sender:    sender,
+		FromMe:    event.Info.IsFromMe,
+		TargetID:  target,
+		Emoji:     reaction.GetText(),
+		Timestamp: stampedAt(reaction.GetSenderTimestampMS(), event),
+	})
+}
+
+// editOf renders `message.edited`.
+func (s *Session) editOf(event *waEvents.Message) change {
+	target, corrected, at := theCorrection(event)
+	if target == "" {
+		return dropping("dropping an edit that names no message to correct")
+	}
+	chat, sender, addressed := s.whereAndWho(event)
+	if !addressed {
+		return dropping("dropping an edit this build cannot address")
+	}
+	return publishing(protocol.EventMessageEdited, protocol.MessageEdited{
+		Chat:      chat,
+		Sender:    sender,
+		MessageID: target,
+		FromMe:    event.Info.IsFromMe,
+		Content:   correctedContent(corrected),
+		Timestamp: at,
+	})
+}
+
+// theCorrection pulls the three things an edit is: which message it corrects, what that
+// message now says, and when the correction was made.
+//
+// An edit arrives in three shapes, and only the first is the one it was sent in.
+//
+// A channel's is shaped differently from everybody else's, and whatsmeow says so on the
+// event rather than in the stanza: the new body arrives unwrapped, under the original
+// post's id, with the edit's own clock off to the side. Read the ordinary way it is a
+// fresh post under an id the client already has.
+//
+// The third is not WhatsApp's doing at all. A message that did not reach this device the
+// first time comes back through another door -- the resend of a placeholder, a history
+// sync -- and whatsmeow's parser for that door takes the edit apart for its caller: the
+// corrected body becomes the message, the target becomes the id on the event, and the
+// only thing left saying an edit was ever wrapped here is the flag. There is no protocol
+// message left to find a key in, so read the ordinary way that correction names nothing
+// and is dropped.
+//
+// The protocol message wins where there is one, because that shape is unambiguous and
+// the wrapper does not have to have carried an edit to be there.
+func theCorrection(event *waEvents.Message) (target string, corrected *waE2E.Message, at int64) {
+	if newsletterEdit(event) {
+		return event.Info.ID, event.Message, event.NewsletterMeta.EditTS.UnixMilli()
+	}
+	if edit := event.Message.GetProtocolMessage(); edit != nil {
+		return edit.GetKey().GetID(), edit.GetEditedMessage(), stampedAt(edit.GetTimestampMS(), event)
+	}
+	if resentEdit(event) {
+		// Taken apart already, and the clock went with the protocol message the parser
+		// left out of the event. It is still on the raw message the parser kept, at the
+		// millisecond the stanza's own second cannot hold -- and that difference is the
+		// whole of the order between two corrections of one message made in the same
+		// second. Truncated, the client is left with a tie and arrival to break it,
+		// which is the thing that was out of order to begin with.
+		return event.Info.ID, event.Message, stampedAt(theResentCorrection(event).GetTimestampMS(), event)
+	}
+	return "", nil, 0
+}
+
+// resentEdit reports whether the parser for the resend door took an edit apart on the
+// way in.
+//
+// It is read off what the parser did rather than off a flag, because the flag is only
+// half there: IsEdit is raised for the shape that arrived inside an EditedMessage
+// envelope and not for the one that did not, while the id is rewritten for both. And
+// that rewrite is the tell -- the parser replaces the event's id with the corrected
+// message's only when what it unwrapped was an edit, so an id that no longer matches the
+// one on the web message it was built from is the parser saying so. Without this, the
+// envelope-less shape arrives looking like an ordinary message under the id of the
+// message it was correcting, which is the id a client would then find and overwrite.
+func resentEdit(event *waEvents.Message) bool {
+	return event.SourceWebMsg != nil && event.Info.ID != event.SourceWebMsg.GetKey().GetID()
+}
+
+// theResentCorrection is the protocol message a correction was taken out of, read back
+// off the raw message the parser kept.
+//
+// The unwrapping is the library's own, run again on a copy, because the parser unwraps
+// before it looks and the envelopes it goes through are its list to grow: a correction
+// the account made from another device arrives inside a DeviceSentMessage, one in a
+// disappearing chat inside an EphemeralMessage. A hand-written copy of that list would
+// drift, and what drifts off is the clock -- the correction still publishes, at the
+// stanza's second instead of its own millisecond.
+//
+// The copy is what keeps this from touching the event: UnwrapRaw writes as it reads.
+func theResentCorrection(event *waEvents.Message) *waE2E.ProtocolMessage {
+	replayed := (&waEvents.Message{RawMessage: event.RawMessage}).UnwrapRaw()
+	return replayed.Message.GetProtocolMessage()
+}
+
+// correctedContent renders what a message says now that it has been corrected.
+//
+// Deliberately not the renderer the message path uses. That one fetches the file of a
+// media message, and an edit never changes the file: WhatsApp lets a caption be
+// rewritten and nothing else. The bytes are the ones the client already holds a
+// reference to, so fetching them again would mint a second blob for the same file and
+// charge the account's bandwidth for a caption.
+//
+// A body with no arm here is the unsupported placeholder, as it is on the message path,
+// and not a withheld acknowledgement (#402): the client learns the message was corrected
+// into something this build cannot show and keeps the bubble it has.
+func correctedContent(corrected *waE2E.Message) any {
+	if corrected == nil {
+		return protocol.Unsupported(protocol.UnsupportedEmpty)
+	}
+	// A document that gains a caption is sent in its own envelope, and inside an edit
+	// whatsmeow unwraps the edit and not that envelope: this connector sends one for a
+	// caption correction of a document (#32), and so may any other client.
+	if inner := corrected.GetDocumentWithCaptionMessage().GetMessage(); inner != nil {
+		corrected = inner
+	}
+	if text, _, ok := textOf(corrected); ok {
+		return protocol.Text(text)
+	}
+	if part, ok := attachmentOf(corrected); ok {
+		// No Ref, on purpose: see protocol.MessageEdited.
+		return part.content
+	}
+	return protocol.Unsupported(protocol.UnsupportedUnknownType).Detailed(armOf(corrected))
+}
+
+// revokeOf renders `message.revoked`.
+func (s *Session) revokeOf(event *waEvents.Message) change {
+	chat, sender, addressed := s.whereAndWho(event)
+	if !addressed {
+		return dropping("dropping a deletion this build cannot address")
+	}
+	target := event.Message.GetProtocolMessage().GetKey().GetID()
+	if target == "" && chat.Kind == protocol.AddressNewsletter {
+		// A channel deletes a post by sending the deletion under the post's own id, with
+		// no body at all to name a key in. It is the same asymmetry a channel's edit has,
+		// and the library's own send path is where it is written down.
+		target = event.Info.ID
+	}
+	if target == "" {
+		return dropping("dropping a deletion that names no message to delete")
+	}
+
+	// Who performed the deletion, not who wrote what was deleted. A group admin removing
+	// somebody else's message is the account's own act when the account is that admin,
+	// and `sender` is what says who it was in every other case.
+	//
+	// A channel cannot answer it at all. whatsmeow does not work out `from_me` for a
+	// newsletter stanza -- it says so, in as many words, where it fills the rest of the
+	// source in -- so the account deleting its own post from another device is
+	// indistinguishable here from the channel's owner deleting one. Both are published
+	// as the contact's, because the two mistakes are not the same size: the client keeps
+	// the text and the files of a contact's deletion and destroys them for its own, so
+	// guessing `self` would take an agent's copy of a post nobody asked it to.
+	by := protocol.RevokedByContact
+	if event.Info.IsFromMe {
+		by = protocol.RevokedBySelf
+	}
+	author := s.claimedAuthor(event)
+	if author == nil && chat.Kind == protocol.AddressGroup {
+		// In a group a key identifies a message by its participant, or by `from_me` where
+		// it is the sender's own. A key carrying neither -- or naming something that is
+		// not a person -- names no message at all, so WhatsApp applies nothing and every
+		// phone in the group goes on showing the message. Publishing it would take the
+		// bubble off an agent's screen on the strength of a key nobody else honoured, and
+		// omitting only the claim would not help: absent is what a direct chat sends, and
+		// a client cannot tell the two apart. whatsmeow refuses the same key on its own
+		// path, for the same reason.
+		return dropping("dropping a group deletion whose key names no message")
+	}
+
+	return publishing(protocol.EventMessageRevoked, protocol.MessageRevoked{
+		Chat:      chat,
+		Sender:    sender,
+		MessageID: target,
+		Author:    author,
+		By:        by,
+		Timestamp: event.Info.Timestamp.UnixMilli(),
+	})
+}
+
+// claimedAuthor reads the participant off a deletion's key: who the key says wrote the
+// message it deletes. It is claimed and not established -- see protocol.MessageRevoked
+// for why this connector cannot establish it, and why passing the claim on is what makes
+// the client able to.
+//
+// `from_me` on the key wins over the participant, and a key can carry both. It says the
+// message being deleted is the sender's own, and that is how WhatsApp resolves the key:
+// whatsmeow's own getOrigSenderFromKey returns the stanza's sender and never reads the
+// participant when the flag is set. Publishing the participant there would hand a client
+// a claim WhatsApp does not make -- and it is the claim that makes the client's
+// comparison pass, for a deletion no phone applied, which is the whole exploit again.
+//
+// Nil where the key names nobody: a direct chat, where the key names the chat and the two
+// parties are all there is. An unreadable participant is nil for the same reason a mention
+// that will not parse is dropped -- the client keeps the behaviour it had before the field
+// existed, rather than losing the deletion over the annotation on it.
+func (s *Session) claimedAuthor(event *waEvents.Message) *protocol.Party {
+	key := event.Message.GetProtocolMessage().GetKey()
+	var claiming []waTypes.JID
+	if key.GetFromMe() {
+		// Both namespaces, the way every other sender on this path is named. Which of the
+		// two arrives as the sender and which as the alternative depends on the chat's
+		// addressing mode, and a claim named in one namespace is one the client may not
+		// be able to match: its copy of the message is keyed by whichever half it learned
+		// first, and a claim it cannot match reads as a mismatch and drops a deletion
+		// that was real.
+		//
+		// The alternative only where the stanza carried it. A phone-addressed message
+		// that arrived without `sender_lid` has one filled in from the mapping every
+		// account on the deployment shares, and naming the author by it would put another
+		// operator's pairing on this event and into what this session learns from it.
+		claiming = []waTypes.JID{event.Info.Sender, wireAlt(&event.Info)}
+	} else if directChat(event.Info.Chat) {
+		// A chat's key carries no participant and is not read for one. WhatsApp addresses
+		// a message there by the conversation, which is why `BuildMessageKey` writes a
+		// participant only outside a chat and `getOrigSenderFromKey` reads the key's own
+		// remote JID rather than the participant. Reading one anyway would take a field
+		// nothing else honours and publish it as the claim -- and the claim is what makes
+		// a client's comparison pass, for a deletion no phone applied, which is the whole
+		// reason the field is checked rather than trusted.
+		return nil
+	} else {
+		named := key.GetParticipant()
+		// Exactly one `@`, because ParseJID splits on it and keeps the first two pieces:
+		// `5541988887777@s.whatsapp.net@junk` parses happily into the real participant's
+		// number, and the claim would then name the person the key was written to point
+		// past. A round trip through String() would catch that as well, and it would also
+		// reject the legacy `5541988887777.0:12@s.whatsapp.net`, which normalises to a
+		// different spelling of the same person -- a deletion dropped over a formatting
+		// difference.
+		if strings.Count(named, "@") != 1 {
+			return nil
+		}
+		parsed, err := waTypes.ParseJID(named)
+		if err != nil {
+			return nil
+		}
+		claiming = []waTypes.JID{parsed}
+	}
+
+	// Its own budget, and only spent when a key named somebody: whereAndWho's is closed
+	// by the time this runs, and a deletion that names nobody must not pay for a lookup
+	// there is nothing to look up.
+	looking, done := s.looking()
+	defer done()
+
+	// Checked, not trusted. The participant is the one field on this event a stranger
+	// writes -- it rides inside the message body rather than on the envelope WhatsApp
+	// fills in, and `ParseJID` takes any user part at all -- while the contract says a
+	// party is digits. A `phone` of "not-a-number" is a frame a strict client rejects
+	// whole, and it would take the deletion down with it.
+	author := s.party(looking, claiming...)
+	if !onlyDigits(author.Phone) {
+		author.Phone = ""
+	}
+	if !onlyDigits(author.LID) {
+		author.LID = ""
+	}
+	if author.Phone == "" && author.LID == "" {
+		return nil
+	}
+	return &author
+}
+
+// directChat reports whether a conversation's key names no participant, which is what
+// WhatsApp does in a one-to-one chat and nowhere else. The servers are whatsmeow's own
+// list, from the `BuildMessageKey` that decides where to write one.
+//
+// Off the stanza's own chat rather than the address this connector publishes, and a
+// broadcast is why the two differ: a message sent through a list shows up in the direct
+// conversation with whoever sent it, so that is where this publishes it, while the key
+// stays a list's -- participant and all.
+func directChat(chat waTypes.JID) bool {
+	switch chat.Server {
+	case waTypes.DefaultUserServer, waTypes.HiddenUserServer, waTypes.MessengerServer:
+		return true
+	default:
+		return false
+	}
+}
+
+// whereAndWho is the half of these three events that does not depend on which one it is.
+//
+// The refusals are the ones inboundOf makes, for the same reasons: a chat the contract
+// cannot name is one the client cannot open, and an unattributed change in a direct chat
+// reads as the person on the other side of it, which puts somebody else's correction,
+// deletion or reaction in their mouth. An echo carries no sender at all, because
+// `from_me` is the whole answer to who did it.
+func (s *Session) whereAndWho(event *waEvents.Message) (protocol.Address, *protocol.Party, bool) {
+	// Its own budget rather than the caller's, and the caller is why: these run on the
+	// event path, where the handlers above have no context to hand down. Resolving an
+	// address is a local read, so what it needs is a bound and not a deadline inherited
+	// from somewhere.
+	looking, done := s.looking()
+	defer done()
+
+	chat, named := s.chatOf(looking, &event.Info)
+	if !named {
+		return protocol.Address{}, nil, false
+	}
+	if event.Info.IsFromMe {
+		return chat, nil, true
+	}
+	sender, attributed := s.partyOf(looking, &event.Info)
+	if !attributed {
+		return protocol.Address{}, nil, false
+	}
+	return chat, sender, true
+}
+
+// stampedAt is the clock one of these is ordered by: the sender's own where they set
+// one, and arrival where they did not.
+//
+// It matters more here than it does for a message. Two reactions from the same person,
+// or two edits of the same message, are the same row on the client and the later one
+// wins -- and arrival is the thing that is out of order, which is why it is only the
+// fallback.
+func stampedAt(stated int64, event *waEvents.Message) int64 {
+	if stated != 0 {
+		return stated
+	}
+	return event.Info.Timestamp.UnixMilli()
+}

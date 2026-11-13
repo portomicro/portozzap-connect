@@ -1,0 +1,469 @@
+package protocol
+
+// AddressKind is what an address points at. The contract keeps it separate from the id
+// because the same digits mean different accounts under different kinds: a LID and a
+// phone number are both digits and are not interchangeable.
+type AddressKind string
+
+// The address kinds the contract defines.
+const (
+	AddressPhone      AddressKind = "phone"
+	AddressLID        AddressKind = "lid"
+	AddressGroup      AddressKind = "group"
+	AddressNewsletter AddressKind = "newsletter"
+	AddressBroadcast  AddressKind = "broadcast"
+	AddressStatus     AddressKind = "status"
+)
+
+// Address is a WhatsApp addressable entity as it travels on the wire. The id never
+// carries the @server suffix, the device or the agent part, so a client can compare
+// two addresses without knowing how WhatsApp spells them this month.
+type Address struct {
+	Kind AddressKind `json:"kind"`
+	ID   string      `json:"id"`
+}
+
+// Party is the human or business behind an address. Both identifiers are carried when
+// both are known, because a client that has only ever seen one of them still has to
+// recognise the other as the same person: WhatsApp addresses the same account by phone
+// number in one chat and by LID in the next.
+type Party struct {
+	Phone        string `json:"phone,omitempty"`
+	LID          string `json:"lid,omitempty"`
+	PushName     string `json:"push_name,omitempty"`
+	VerifiedName string `json:"verified_name,omitempty"`
+}
+
+// TextContent is a message whose whole body is text.
+type TextContent struct {
+	Type string `json:"type"`
+	Body string `json:"body"`
+}
+
+// Text returns the content of a plain text message.
+func Text(body string) TextContent { return TextContent{Type: "text", Body: body} }
+
+// InboundMessage is one message as the client receives it, whoever sent it: `from_me`
+// separates a message this account sent from another device from one that arrived.
+//
+// Content is left open because the contract's `content` is a union and the engine is
+// what knows which arm it is rendering.
+type InboundMessage struct {
+	ID        string    `json:"id"`
+	Chat      Address   `json:"chat"`
+	Sender    *Party    `json:"sender,omitempty"`
+	FromMe    bool      `json:"from_me"`
+	Timestamp int64     `json:"timestamp"`
+	Content   any       `json:"content"`
+	QuotedID  string    `json:"quoted_id,omitempty"`
+	Mentions  []Address `json:"mentions,omitempty"`
+	// Ephemeral is the disappearing-message expiration in seconds, zero when the chat
+	// is not on a timer.
+	Ephemeral uint32 `json:"ephemeral,omitempty"`
+}
+
+// MediaKind is what sort of file a media message carries. The contract's enum is
+// smaller than WhatsApp's own set of message types on purpose: an animated GIF is a
+// video, a voice note is an audio with `voice_note` set, and an animated sticker is
+// still a sticker. A client renders five things rather than fifteen.
+type MediaKind string
+
+// The media kinds the contract defines.
+const (
+	MediaImage    MediaKind = "image"
+	MediaVideo    MediaKind = "video"
+	MediaAudio    MediaKind = "audio"
+	MediaDocument MediaKind = "document"
+	MediaSticker  MediaKind = "sticker"
+)
+
+// MediaRefKind is how the bytes behind a media message are reached. The enum is shared
+// across every provider that speaks this contract, so a client written against it can
+// resolve a reference without knowing which one issued it.
+type MediaRefKind string
+
+// The reference kinds the contract defines.
+const (
+	// MediaRefURL is a URL whoever holds it can fetch. It is what an outbound
+	// attachment carries and what survives being handed on.
+	MediaRefURL MediaRefKind = "url"
+	// MediaRefConnectorBlob is a file on the instance that downloaded it, served over
+	// that instance's own HTTP port against the token the registry publishes. It means
+	// nothing to anybody else, and it is what this connector issues.
+	MediaRefConnectorBlob MediaRefKind = "connector_blob"
+	// MediaRefUazapiMessage is a message id only the Uazapi instance that saw it can
+	// resolve. This connector never issues one; the constant is here because the enum
+	// is the contract's, not this implementation's.
+	MediaRefUazapiMessage MediaRefKind = "uazapi_message"
+)
+
+// MediaRef is how a client fetches the bytes of a media message. Media never travels
+// inside a frame: an event says where the file is, and the client goes and gets it.
+type MediaRef struct {
+	Kind    MediaRefKind      `json:"kind"`
+	ID      string            `json:"id,omitempty"`
+	URL     string            `json:"url,omitempty"`
+	Headers map[string]string `json:"headers,omitempty"`
+	Size    int64             `json:"size,omitempty"`
+	Mime    string            `json:"mime,omitempty"`
+	SHA256  string            `json:"sha256,omitempty"`
+	// ExpiresAt is when the issuer stops promising to serve this, in epoch
+	// milliseconds. A blob cache drops what nobody collects, so a reference is a
+	// reference to a file for a while and not for good: a client that finds it lapsed
+	// asks the session for the bytes again rather than telling an agent the media is
+	// gone.
+	ExpiresAt int64 `json:"expires_at,omitempty"`
+}
+
+// MediaContent is a message whose body is a file.
+//
+// Everything but the reference describes the file well enough to render a bubble
+// without having fetched it: the caption reads, the name and size show, and the
+// thumbnail stands in until the bytes arrive. A nil Ref is the file not coming, which
+// is what `media.download_failed` explains.
+type MediaContent struct {
+	Type      string    `json:"type"`
+	Kind      MediaKind `json:"kind"`
+	Mime      string    `json:"mime,omitempty"`
+	Filename  string    `json:"filename,omitempty"`
+	Caption   string    `json:"caption,omitempty"`
+	VoiceNote bool      `json:"voice_note"`
+	Size      int64     `json:"size,omitempty"`
+	// Duration is how long an audio or a video runs, in seconds.
+	Duration uint32 `json:"duration,omitempty"`
+	// Width and Height are the picture's size in pixels, for an image, a video or a
+	// sticker. A recipient's client lays the bubble out from these before a byte of the
+	// file has arrived, so with them the conversation does not jump when the media lands.
+	// WhatsApp's own clients always send them. The connector does not decode media, so
+	// they come from the caller, which already has the file.
+	Width  uint32 `json:"width,omitempty"`
+	Height uint32 `json:"height,omitempty"`
+	// Waveform is the shape a voice note's bubble draws: exactly 64 samples of amplitude,
+	// each 0-100. Absent is a flat bar, which is how a note sent from here reads without
+	// it. Computing one means decoding the audio, which this connector does not do and
+	// the caller, holding the file and an ffmpeg, already can.
+	Waveform []int `json:"waveform,omitempty"`
+	// Thumbnail is a data: URI small enough to travel inside the frame, which is the
+	// one exception to media never doing so.
+	Thumbnail string    `json:"thumbnail,omitempty"`
+	Ref       *MediaRef `json:"ref,omitempty"`
+}
+
+// Media returns the content of a media message of the given kind, for a caller that
+// fills in what it knows about the file.
+func Media(kind MediaKind) MediaContent { return MediaContent{Type: "media", Kind: kind} }
+
+// MediaDownloadFailure is `media.download_failed`: the bytes of a message the client
+// already has did not arrive with it. Whether they ever will is what Recoverable says.
+//
+// It is published after the message it is about, never instead of it. The client looks
+// the message up to flag it, and a failure that arrives first names a message nobody
+// has stored yet.
+type MediaDownloadFailure struct {
+	Chat      Address `json:"chat"`
+	MessageID string  `json:"message_id"`
+	Reason    string  `json:"reason"`
+	// Recoverable is WhatsApp having dropped the file while the sender's phone may
+	// still hold it, which `message.download_media` can ask for. It is the one failure
+	// here that is not the end of the story, and it is a field of its own rather than a
+	// value of Reason because Reason is the explanation an operator reads and a client
+	// branching on it would be reading a sentence.
+	//
+	// False is what every producer said before this field existed, and it is the safe
+	// half: a client that does not know the field flags the bubble exactly as it always
+	// did, and one that does asks for the bytes instead.
+	Recoverable bool `json:"recoverable"`
+}
+
+// MessageEdited is `message.edited`: somebody corrected a message the client already
+// has. MessageID names the message being corrected, never the stanza that carries the
+// correction, because the client's whole job here is to find the bubble and rewrite it.
+//
+// Content is the message as it now reads. A media caption edit carries the media arm
+// with the new caption and no Ref: an edit changes what a message says and never the
+// file it carries, so the reference the client got with the original message is still
+// the right one, and issuing a second one would mint a second blob for the same bytes.
+type MessageEdited struct {
+	Chat      Address `json:"chat"`
+	Sender    *Party  `json:"sender,omitempty"`
+	MessageID string  `json:"message_id"`
+	FromMe    bool    `json:"from_me"`
+	Content   any     `json:"content"`
+	Timestamp int64   `json:"timestamp"`
+}
+
+// RevokedBy is who deleted a message for everyone, from the account's point of view.
+type RevokedBy string
+
+// The revokers the contract names. There is no third arm for a group admin deleting
+// somebody else's message: the account either performed the deletion or it did not, and
+// `sender` is what says who it was.
+const (
+	RevokedByContact RevokedBy = "contact"
+	RevokedBySelf    RevokedBy = "self"
+)
+
+// MessageRevoked is `message.revoked`: a message the client already has was deleted for
+// everyone. The two revokers are not the same event to a client — a deletion this
+// account performed is applied the way its own deletion is, files included, while one
+// somebody else performed only flags the bubble and leaves the text an agent can still
+// read.
+//
+// Author is who the deletion's own key names as having written the message it deletes,
+// which is the half of a message's identity a bare id does not carry: WhatsApp addresses
+// a message in a group by (id, participant), so a key naming somebody who did not write
+// it names no message at all and every phone applies nothing. This connector cannot
+// check the claim -- it keeps no record of who wrote what, and asking the group who its
+// admins are is a round trip per deletion -- so it hands the claim to the client, which
+// resolved the message by id and knows its author.
+//
+// A key that says the message is the deleter's own names the deleter, whatever else the
+// key carries: that is how WhatsApp resolves it, so it is the claim being made. Absent
+// means the key named nobody WhatsApp reads, which is a one-to-one chat: a key there
+// addresses the message by the conversation, so a participant in one is a field nothing
+// else honours and this connector does not pass it on either. A broadcast is not that
+// chat, whichever conversation the message shows up in: its key names a participant like
+// any other, and the field carries it.
+//
+// A group deletion always carries one. A key there identifies a message by its participant
+// or by `from_me`, so one with neither names no message at all, and the connector drops it
+// rather than publishing a deletion no phone applied.
+type MessageRevoked struct {
+	Chat      Address   `json:"chat"`
+	Sender    *Party    `json:"sender,omitempty"`
+	MessageID string    `json:"message_id"`
+	Author    *Party    `json:"message_author,omitempty"`
+	By        RevokedBy `json:"by"`
+	Timestamp int64     `json:"timestamp"`
+}
+
+// MessageReaction is `message.reaction`: somebody put an emoji on a message, or took
+// one back.
+//
+// ID is the reaction's own message id, which is what makes it deduplicable and what
+// matches the echo of a reaction this client sent. Emoji is never omitted: an empty one
+// is the removal, and leaving the field out would read as a reaction with no emoji
+// rather than as the reaction being taken back.
+type MessageReaction struct {
+	ID        string  `json:"id"`
+	Chat      Address `json:"chat"`
+	Sender    *Party  `json:"sender,omitempty"`
+	FromMe    bool    `json:"from_me"`
+	TargetID  string  `json:"target_id"`
+	Emoji     string  `json:"emoji"`
+	Timestamp int64   `json:"timestamp"`
+}
+
+// ReceiptKind is what became of a message, as the contract names it.
+type ReceiptKind string
+
+// The four the contract has. WhatsApp reports more than this, and the engine is what
+// decides which of its own shapes each of these covers.
+const (
+	ReceiptDelivered ReceiptKind = "delivered"
+	ReceiptRead      ReceiptKind = "read"
+	ReceiptPlayed    ReceiptKind = "played"
+	ReceiptFailed    ReceiptKind = "failed"
+)
+
+// MessageReceipt is `message.receipt`: what happened to messages that already exist.
+//
+// MessageIDs is a list because WhatsApp reports a chat being opened as one receipt over
+// everything unread in it, and splitting that into one event per message would multiply
+// a burst by the size of the backlog. Measured rather than assumed: opening one ordinary
+// direct chat produced a single read over twenty message ids, and a played over three
+// more alongside it.
+//
+// Participant is who the receipt is from, and it is set even in a direct chat where it
+// repeats the chat's own address. That repetition is the point: the same four names
+// cover a receipt about a message this account sent and one about a message it received
+// and read from another of its own devices, and the only thing separating them is whose
+// device reported it. A client comparing this against its own number can tell, and one
+// that does not care can ignore the field.
+type MessageReceipt struct {
+	Chat        Address     `json:"chat"`
+	MessageIDs  []string    `json:"message_ids"`
+	Type        ReceiptKind `json:"type"`
+	Participant *Address    `json:"participant,omitempty"`
+	Error       *Error      `json:"error,omitempty"`
+	Timestamp   int64       `json:"timestamp"`
+}
+
+// TypingState is what the other side is shown above a chat.
+type TypingState string
+
+// WhatsApp has two of these and a media attribute beside them; the contract has three.
+const (
+	TypingComposing TypingState = "composing"
+	TypingRecording TypingState = "recording"
+	TypingPaused    TypingState = "paused"
+)
+
+// ChatPresence is `chat.presence`: somebody typing or recording in a chat, or stopping.
+//
+// Sender is nullable because a direct chat has nobody else to name: the chat is the
+// person. In a group it is who is typing, which is the whole information.
+type ChatPresence struct {
+	Chat   Address     `json:"chat"`
+	Sender *Party      `json:"sender,omitempty"`
+	State  TypingState `json:"state"`
+}
+
+// PresenceState is whether somebody is at their phone.
+type PresenceState string
+
+// Two, and not three: WhatsApp reports somebody going away, and how long ago they were
+// last there is a field on the event rather than a state of its own.
+const (
+	PresenceAvailable   PresenceState = "available"
+	PresenceUnavailable PresenceState = "unavailable"
+)
+
+// PresenceUpdate is `presence.update`: somebody coming online or going away. It arrives
+// only for a party this session subscribed to, one at a time.
+//
+// LastSeen is a pointer because hiding it and having been last seen at the epoch are
+// different facts, and a zero would say the second.
+type PresenceUpdate struct {
+	Party    Party         `json:"party"`
+	State    PresenceState `json:"state"`
+	LastSeen *int64        `json:"last_seen,omitempty"`
+}
+
+// LocationContent is a pin on a map. The coordinates are the whole message: there is
+// nothing to fetch, which is what separates it from every other content that is not text.
+type LocationContent struct {
+	Type      string  `json:"type"`
+	Latitude  float64 `json:"latitude"`
+	Longitude float64 `json:"longitude"`
+	Name      string  `json:"name,omitempty"`
+	Address   string  `json:"address,omitempty"`
+	// Live says the sender is still moving and WhatsApp expects the pin to be updated.
+	// It is carried so a client can say so rather than showing a stale pin as current.
+	Live bool `json:"live"`
+}
+
+// Location returns the content of a pin, for a caller that fills in what it knows.
+func Location(latitude, longitude float64) LocationContent {
+	return LocationContent{Type: "location", Latitude: latitude, Longitude: longitude}
+}
+
+// Contact is one card in a share.
+//
+// The vCard is carried verbatim and the other two are read out of it, because the card
+// may hold several numbers, an email and a company that these fields cannot express: a
+// client that renders a row wants the name and the number, and one that stores the
+// contact wants everything.
+type Contact struct {
+	DisplayName string `json:"display_name,omitempty"`
+	Phone       string `json:"phone,omitempty"`
+	Vcard       string `json:"vcard,omitempty"`
+}
+
+// ContactsContent is one or more cards somebody shared.
+type ContactsContent struct {
+	Type     string    `json:"type"`
+	Contacts []Contact `json:"contacts"`
+}
+
+// Contacts returns the content of a share.
+func Contacts(cards []Contact) ContactsContent {
+	return ContactsContent{Type: "contacts", Contacts: cards}
+}
+
+// UnsupportedReason is why a message arrived without a body a client can render.
+type UnsupportedReason string
+
+// The reasons the contract defines.
+const (
+	// UnsupportedUnknownType is a body this build has no arm for: a poll, an order, a
+	// card this milestone has yet to reach.
+	UnsupportedUnknownType UnsupportedReason = "unknown_type"
+	// UnsupportedUndecryptable is a message whose ciphertext could not be opened.
+	UnsupportedUndecryptable UnsupportedReason = "undecryptable"
+	// UnsupportedUnavailable is a message this device was never given: the stanza carried
+	// no ciphertext at all, which is not the same as one that would not open. WhatsApp has
+	// answered a companion device that way for a view-once photo sent from a phone, asking
+	// the primary phone to forward it instead -- which it may never do.
+	//
+	// A property of the sender rather than of view-once itself, as far as anything here has
+	// measured: `TestLiveViewOnceReachesACompanion` sends the same shapes from a second
+	// linked device and the bytes arrive every time.
+	UnsupportedUnavailable UnsupportedReason = "unavailable"
+	// UnsupportedMasked is a message WhatsApp withheld from every linked device on
+	// purpose. An authentication template -- a verification code -- is delivered to the
+	// primary phone and replaced here by a placeholder, with no way to opt out.
+	//
+	// Its own reason and not `unknown_type`, which is the difference a client draws a
+	// bubble from: `unknown_type` says this build has no arm for what arrived and a
+	// later one may, while nothing will ever render this, because it was never sent
+	// here. Nor `unavailable`, which is content this device was not given but the
+	// primary phone can still be asked for; this one is on the phone and nowhere else,
+	// and that is the whole of what there is to tell the reader.
+	UnsupportedMasked UnsupportedReason = "masked"
+	// UnsupportedProtocol is machinery rather than a message.
+	UnsupportedProtocol UnsupportedReason = "protocol"
+	// UnsupportedEmpty is a message that arrived carrying nothing at all.
+	UnsupportedEmpty UnsupportedReason = "empty"
+)
+
+// UnsupportedContent is a message that arrived and cannot be rendered.
+//
+// It is a placeholder and it is the point: an agent seeing a bubble they cannot read
+// knows somebody sent something, and can ask. The alternative this replaces was
+// withholding the acknowledgement, which leaves WhatsApp redelivering the same message
+// for as long as the session is up and shows the agent nothing either way.
+type UnsupportedContent struct {
+	Type   string            `json:"type"`
+	Reason UnsupportedReason `json:"reason"`
+	// Detail names what WhatsApp actually sent, for whoever reads the placeholder later:
+	// the protocol message's type for `protocol`, the message's arm for `unknown_type`.
+	// Absent for every other reason, and when nothing could be named.
+	Detail string `json:"detail,omitempty"`
+}
+
+// Unsupported returns the content of a message nothing here can render.
+func Unsupported(reason UnsupportedReason) UnsupportedContent {
+	return UnsupportedContent{Type: "unsupported", Reason: reason}
+}
+
+// Detailed is the same placeholder, naming what arrived.
+func (c UnsupportedContent) Detailed(detail string) UnsupportedContent {
+	c.Detail = detail
+	return c
+}
+
+// The catalogues below are what TestPayloadEnumsMatchSchema walks. A value added to one
+// of these types and not to its enum in `contract/schema/protocol.schema.json` -- or the
+// other way round -- is a client and a connector disagreeing about what may travel, and
+// the catalogue is what makes that difference visible to a test rather than to a
+// deployment.
+
+// AllAddressKinds lists every kind of address a canonical address can name.
+var AllAddressKinds = []AddressKind{
+	AddressPhone, AddressLID, AddressGroup, AddressNewsletter, AddressBroadcast, AddressStatus,
+}
+
+// AllMediaKinds lists every kind of media a message can carry.
+var AllMediaKinds = []MediaKind{MediaImage, MediaVideo, MediaAudio, MediaDocument, MediaSticker}
+
+// AllMediaRefKinds lists every way a media reference can say where a file is.
+var AllMediaRefKinds = []MediaRefKind{MediaRefURL, MediaRefConnectorBlob, MediaRefUazapiMessage}
+
+// AllRevokedBy lists who can have revoked a message.
+var AllRevokedBy = []RevokedBy{RevokedByContact, RevokedBySelf}
+
+// AllReceiptKinds lists every receipt a message can collect.
+var AllReceiptKinds = []ReceiptKind{ReceiptDelivered, ReceiptRead, ReceiptPlayed, ReceiptFailed}
+
+// AllTypingStates lists every state a chat presence can be in.
+var AllTypingStates = []TypingState{TypingComposing, TypingRecording, TypingPaused}
+
+// AllPresenceStates lists every availability an account can publish.
+var AllPresenceStates = []PresenceState{PresenceAvailable, PresenceUnavailable}
+
+// AllUnsupportedReasons lists every reason a message arrives without content.
+var AllUnsupportedReasons = []UnsupportedReason{
+	UnsupportedUnknownType, UnsupportedUndecryptable, UnsupportedUnavailable,
+	UnsupportedMasked, UnsupportedProtocol, UnsupportedEmpty,
+}
